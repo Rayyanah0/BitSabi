@@ -1,0 +1,14 @@
+[package]
+name = "bitsabi-shared"
+description = "Shared product constants and API types for BitSabi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true

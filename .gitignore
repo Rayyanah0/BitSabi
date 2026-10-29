@@ -1,0 +1,34 @@
+# Rust build output
+/target/
+**/target/
+
+# Dioxus / web build output
+.dioxus/
+/dist/
+*.wasm
+*.wasm.map
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local databases and certificates
+*.db
+*.sqlite
+*.pem
+*.key
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak

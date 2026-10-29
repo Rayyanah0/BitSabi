@@ -1,0 +1,18 @@
+[package]
+name = "bitsabi-web"
+description = "BitSabi Dioxus web frontend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+bitsabi-shared.workspace = true
+dioxus = { version = "=0.7.10", features = ["router", "web"] }
+gloo-storage = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
