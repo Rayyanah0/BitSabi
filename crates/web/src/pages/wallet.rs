@@ -70,7 +70,12 @@ enum BroadcastState {
         fee_sat: u64,
         vsize: u64,
     },
-    Failed(String),
+    Failed {
+        message: String,
+        txid: String,
+        fee_sat: u64,
+        vsize: u64,
+    },
 }
 
 #[component]
@@ -100,6 +105,12 @@ pub fn Wallet() -> Element {
     let mut broadcast_state = use_signal(|| BroadcastState::Idle);
     let mut sending = use_signal(|| false);
     let mut visible_tx_count = use_signal(|| HISTORY_PAGE_SIZE);
+    let mut persist_password = use_signal(String::new);
+    let mut persist_message = use_signal(|| None::<String>);
+    let mut unlock_password = use_signal(String::new);
+    let mut has_saved_wallet = use_signal(|| crate::wallet_persistence::load_wallet().is_some());
+    let mut confirm_overwrite_saved = use_signal(|| false);
+    let mut confirm_remove_saved = use_signal(|| false);
 
     let import_word_count = import_phrase.read().split_whitespace().count();
 
@@ -128,6 +139,8 @@ pub fn Wallet() -> Element {
         broadcast_state.set(BroadcastState::Idle);
         sending.set(false);
         visible_tx_count.set(HISTORY_PAGE_SIZE);
+        confirm_overwrite_saved.set(false);
+        confirm_remove_saved.set(false);
         stage.set(WalletStage::Landing);
     });
 
@@ -165,6 +178,78 @@ pub fn Wallet() -> Element {
             );
         },
     );
+
+    let unlock_saved_wallet = use_callback(move |()| {
+        if session.read().is_some() {
+            persist_message.set(Some(
+                "A wallet is already open. Start over before unlocking a saved wallet.".to_owned(),
+            ));
+            return;
+        }
+        let password = unlock_password.read().clone();
+        match crate::wallet_persistence::load_wallet() {
+            Some(envelope) => {
+                match crate::wallet_persistence::decrypt_bytes(&envelope, &password) {
+                    Ok(seed) => match WalletSession::from_seed_bytes(&seed) {
+                        Ok(new_session) => {
+                            unlock_password.set(String::new());
+                            persist_message.set(None);
+                            begin_wallet.call((new_session, WalletSource::Imported));
+                        }
+                        Err(error) => persist_message.set(Some(error.to_string())),
+                    },
+                    Err(error) => persist_message.set(Some(error.to_string())),
+                }
+            }
+            None => persist_message.set(Some("No saved wallet was found.".to_owned())),
+        }
+    });
+
+    let save_wallet_to_browser = use_callback(move |()| {
+        if has_saved_wallet() && !confirm_overwrite_saved() {
+            confirm_overwrite_saved.set(true);
+            persist_message.set(Some(
+                "A saved wallet already exists. Press \"Save wallet\" again to overwrite it, or cancel."
+                    .to_owned(),
+            ));
+            return;
+        }
+        confirm_overwrite_saved.set(false);
+
+        let password = persist_password.read().clone();
+        let seed = session.read().as_ref().map(WalletSession::export_seed);
+        let Some(seed) = seed else {
+            persist_message.set(Some("No wallet session is available.".to_owned()));
+            return;
+        };
+        match crate::wallet_persistence::encrypt_bytes(&seed, &password) {
+            Ok(envelope) => match crate::wallet_persistence::save_wallet(&envelope) {
+                Ok(()) => {
+                    has_saved_wallet.set(true);
+                    persist_password.set(String::new());
+                    confirm_overwrite_saved.set(false);
+                    persist_message.set(Some("Wallet saved in encrypted form.".to_owned()));
+                }
+                Err(error) => persist_message.set(Some(error.to_string())),
+            },
+            Err(error) => persist_message.set(Some(error.to_string())),
+        }
+    });
+
+    let remove_saved_wallet = use_callback(move |()| {
+        if !confirm_remove_saved() {
+            confirm_remove_saved.set(true);
+            persist_message.set(Some(
+                "Confirm deletion of the saved wallet. This does not close the open wallet, but you will need your recovery phrase to restore it later."
+                    .to_owned(),
+            ));
+            return;
+        }
+        confirm_remove_saved.set(false);
+        crate::wallet_persistence::clear_wallet();
+        has_saved_wallet.set(false);
+        persist_message.set(Some("Saved wallet removed.".to_owned()));
+    });
 
     let start_create = use_callback(move |()| {
         reset_to_landing.call(());
@@ -387,7 +472,12 @@ pub fn Wallet() -> Element {
     });
 
     let confirm_send = use_callback(move |()| {
-        if sending() {
+        if sending()
+            || matches!(
+                &*broadcast_state.read(),
+                BroadcastState::Broadcasting | BroadcastState::Success { .. }
+            )
+        {
             return;
         }
         let Some(plan) = send_plan.read().clone() else {
@@ -409,27 +499,26 @@ pub fn Wallet() -> Element {
             }
         };
 
+        if let Some(change_address) = plan.change_address.as_deref() {
+            if let Some(wallet) = session.write().as_mut() {
+                if let Err(error) = wallet.record_change_used(change_address) {
+                    wallet_error.set(Some(error.to_string()));
+                }
+            }
+        }
+
         send_signed.set(Some(signed.clone()));
         send_error.set(None);
         broadcast_state.set(BroadcastState::Broadcasting);
         sending.set(true);
 
         let raw_transaction_hex = signed.raw_hex.clone();
-        let expected_txid = signed.txid.clone();
+        let submitted_txid = signed.txid.clone();
         let fee_sat = signed.fee_sat;
         let vsize = signed.vsize;
-        let change_sat = signed.change_sat;
         spawn(async move {
             match api::broadcast_transaction(raw_transaction_hex).await {
-                Ok(response) if response.txid == expected_txid => {
-                    if change_sat > 0 {
-                        if let Some(wallet) = session.write().as_mut() {
-                            if let Err(error) = wallet.record_change_used() {
-                                wallet_error.set(Some(error.to_string()));
-                            }
-                        }
-                    }
-
+                Ok(response) if response.txid == submitted_txid => {
                     let addresses = session
                         .read()
                         .as_ref()
@@ -453,14 +542,22 @@ pub fn Wallet() -> Element {
                 }
                 Ok(_) => {
                     sending.set(false);
-                    broadcast_state.set(BroadcastState::Failed(
-                        "The provider returned a different transaction ID. Refresh before retrying."
+                    broadcast_state.set(BroadcastState::Failed {
+                        message: "The provider returned a different transaction ID. Refresh before retrying."
                             .to_owned(),
-                    ));
+                        txid: submitted_txid,
+                        fee_sat,
+                        vsize,
+                    });
                 }
                 Err(error) => {
                     sending.set(false);
-                    broadcast_state.set(BroadcastState::Failed(error.message().to_owned()));
+                    broadcast_state.set(BroadcastState::Failed {
+                        message: error.message().to_owned(),
+                        txid: submitted_txid,
+                        fee_sat,
+                        vsize,
+                    });
                 }
             }
         });
@@ -495,6 +592,45 @@ pub fn Wallet() -> Element {
                     h2 { "A full testnet wallet" }
                     p {
                         "Balances, multiple receiving addresses, fee-aware sends, and transaction history. Testnet coins have no real value."
+                    }
+                }
+            }
+
+            if has_saved_wallet() {
+                section { class: "wallet-panel",
+                    div { class: "wallet-panel__header",
+                        div {
+                            h2 { "Unlock saved wallet" }
+                            p { "This browser has an encrypted wallet. Enter its password to restore the session." }
+                        }
+                    }
+                    if let Some(message) = persist_message.read().as_ref() {
+                        p { class: "wallet-error", role: "alert", "{message}" }
+                    }
+                    form {
+                        class: "wallet-form",
+                        onsubmit: move |event| {
+                            event.prevent_default();
+                            unlock_saved_wallet.call(());
+                        },
+                        div { class: "wallet-field",
+                            label { r#for: "wallet-unlock-password", "Password" }
+                            input {
+                                id: "wallet-unlock-password",
+                                class: "wallet-input",
+                                r#type: "password",
+                                value: "{unlock_password.read()}",
+                                oninput: move |event| unlock_password.set(event.value()),
+                                autocomplete: "current-password",
+                            }
+                        }
+                        div { class: "wallet-flow__actions",
+                            button {
+                                class: "button button--primary",
+                                r#type: "submit",
+                                "Unlock wallet"
+                            }
+                        }
                     }
                 }
             }
@@ -948,6 +1084,62 @@ pub fn Wallet() -> Element {
                         }
                     }
 
+                    section { class: "wallet-panel",
+                        div { class: "wallet-panel__header",
+                            div {
+                                h2 { "Save wallet to this browser" }
+                                p { "Encrypts the signing seed with a password and stores it only in this browser. Refreshing can then restore the wallet after you unlock it." }
+                            }
+                        }
+                        if let Some(message) = persist_message.read().as_ref() {
+                            p { class: "wallet-field__help", "{message}" }
+                        }
+                        div { class: "wallet-field",
+                            label { r#for: "wallet-persist-password", "Password" }
+                            input {
+                                id: "wallet-persist-password",
+                                class: "wallet-input",
+                                r#type: "password",
+                                value: "{persist_password.read()}",
+                                oninput: move |event| persist_password.set(event.value()),
+                                autocomplete: "new-password",
+                            }
+                            p { class: "wallet-field__help",
+                                "Use at least 8 characters. BitSabi cannot recover this password."
+                            }
+                        }
+                        div { class: "wallet-flow__actions",
+                            PrimaryButton {
+                                onclick: move |_| save_wallet_to_browser.call(()),
+                                if confirm_overwrite_saved() { "Confirm overwrite" } else { "Save wallet" }
+                            }
+                            if confirm_overwrite_saved() {
+                                SecondaryButton {
+                                    onclick: move |_| {
+                                        confirm_overwrite_saved.set(false);
+                                        persist_message.set(None);
+                                    },
+                                    "Cancel"
+                                }
+                            }
+                            if has_saved_wallet() {
+                                SecondaryButton {
+                                    onclick: move |_| remove_saved_wallet.call(()),
+                                    if confirm_remove_saved() { "Confirm remove" } else { "Remove saved wallet" }
+                                }
+                            }
+                            if confirm_remove_saved() {
+                                SecondaryButton {
+                                    onclick: move |_| {
+                                        confirm_remove_saved.set(false);
+                                        persist_message.set(None);
+                                    },
+                                    "Cancel"
+                                }
+                            }
+                        }
+                    }
+
                     div { class: "wallet-actions",
                         section { class: "wallet-action-card",
                             div { class: "wallet-action-card__icon", SendReceiveIcon {} }
@@ -1227,6 +1419,13 @@ pub fn Wallet() -> Element {
                                         div { class: "wallet-review__row", span { "Network fee" } strong { "{format_sats(fee_sat)}" } }
                                         div { class: "wallet-review__row", span { "Transaction size" } strong { "{vsize} vB" } }
                                     }
+                                    if let Some(status) = transaction_confirmation_text(&txid, wallet_summary.as_ref()) {
+                                        p { class: "wallet-field__help", "{status}" }
+                                    } else {
+                                        p { class: "wallet-field__help",
+                                            "Waiting for the public provider to index this transaction. Auto-refresh checks again every minute."
+                                        }
+                                    }
                                     a {
                                         class: "text-link",
                                         href: "https://mempool.space/testnet/tx/{txid}",
@@ -1236,7 +1435,7 @@ pub fn Wallet() -> Element {
                                         ExternalLinkIcon {}
                                     }
                                     p { class: "wallet-field__help",
-                                        "Refresh to update confirmations. Broadcast success does not guarantee confirmation."
+                                        "Broadcast success does not guarantee confirmation. Refresh to update confirmations."
                                     }
                                     div { class: "wallet-flow__actions",
                                         SecondaryButton {
@@ -1251,19 +1450,43 @@ pub fn Wallet() -> Element {
                                     }
                                 }
                             }
-                        } else if let BroadcastState::Failed(message) = broadcast {
+                        } else if let BroadcastState::Failed { message, txid, fee_sat, vsize } = &broadcast {
                             div { class: "wallet-alert wallet-alert--error", role: "alert",
                                 WarningIcon {}
                                 div {
                                     strong { "The transaction was not broadcast" }
                                     p { "{message}" }
-                                    p { class: "wallet-field__help",
-                                        "Your keys and signed transaction are still in this tab. You can retry or edit the transaction."
+                                    code { class: "wallet-success__txid", "{txid}" }
+                                    div { class: "wallet-review__rows",
+                                        div { class: "wallet-review__row", span { "Network fee" } strong { "{format_sats(*fee_sat)}" } }
+                                        div { class: "wallet-review__row", span { "Transaction size" } strong { "{vsize} vB" } }
+                                    }
+                                    a {
+                                        class: "text-link",
+                                        href: "https://mempool.space/testnet/tx/{txid}",
+                                        target: "_blank",
+                                        rel: "noopener noreferrer",
+                                        "Check this transaction ID on mempool.space"
+                                        ExternalLinkIcon {}
+                                    }
+                                    if let Some(status) = transaction_confirmation_text(txid, wallet_summary.as_ref()) {
+                                        p { class: "wallet-field__help",
+                                            "The provider now reports this transaction: {status} Refresh the wallet instead of retrying."
+                                        }
+                                    } else {
+                                        p { class: "wallet-field__help",
+                                            "A provider error is not proof that the transaction was rejected. Check its status on the explorer or refresh before retrying. The signed transaction is retained in this tab's memory so you can retry or edit it. Keys are never sent to the API."
+                                        }
                                     }
                                     div { class: "wallet-flow__actions",
                                         SecondaryButton {
                                             onclick: move |_| edit_send.call(()),
                                             "Edit transaction"
+                                        }
+                                        SecondaryButton {
+                                            onclick: move |_| manual_refresh.call(()),
+                                            RefreshIcon {}
+                                            "Refresh wallet"
                                         }
                                         PrimaryButton {
                                             disabled: sending(),
@@ -1291,6 +1514,7 @@ pub fn Wallet() -> Element {
                                     span { class: "pill pill--orange", "Signed locally" }
                                 }
                                 div { class: "wallet-review__rows",
+                                    div { class: "wallet-review__row", span { "Network" } strong { "Bitcoin Testnet" } }
                                     div { class: "wallet-review__row", span { "Recipient" } code { "{plan.recipient}" } }
                                     div { class: "wallet-review__row", span { "Amount" } strong { "{format_sats(plan.amount_sat)}" } }
                                     div { class: "wallet-review__row", span { "Fee rate" } strong { "{plan.fee_rate_sat_vb} sat/vB" } }
@@ -1710,6 +1934,31 @@ fn fee_rate_for_choice(choice: FeeChoice, custom: &str, fees: FeeEstimates) -> R
     Ok(rate)
 }
 
+fn transaction_confirmation_text(txid: &str, summary: Option<&WalletSummary>) -> Option<String> {
+    let transaction = summary?
+        .transactions
+        .iter()
+        .find(|transaction| transaction.txid == txid)?;
+
+    if !transaction.status.confirmed {
+        return Some("Pending in the mempool; it is not confirmed yet.".to_owned());
+    }
+
+    let confirmations = transaction.confirmations;
+    let confirmation_label = if confirmations == 1 {
+        "1 confirmation".to_owned()
+    } else {
+        format!("{confirmations} confirmations")
+    };
+    let block = transaction
+        .status
+        .block_height
+        .map(|height| format!(" in block #{height}"))
+        .unwrap_or_default();
+
+    Some(format!("Confirmed{block} with {confirmation_label}."))
+}
+
 fn short_txid(txid: &str) -> String {
     if txid.len() <= 18 {
         return txid.to_owned();
@@ -1812,6 +2061,51 @@ mod tests {
             "11111111…111111"
         );
         assert_eq!(short_txid("abc"), "abc");
+    }
+
+    #[test]
+    fn broadcast_confirmation_text_tracks_pending_and_confirmed_statuses() {
+        use bitsabi_shared::TransactionStatus;
+
+        let mut summary = WalletSummary {
+            tip_height: 100,
+            ..Default::default()
+        };
+        summary.transactions.push(HistoryTransaction {
+            txid: "pending".to_owned(),
+            net_value: -1_000,
+            fee: Some(10),
+            status: TransactionStatus {
+                confirmed: false,
+                block_height: None,
+                block_time: None,
+            },
+            confirmations: 0,
+        });
+        summary.transactions.push(HistoryTransaction {
+            txid: "confirmed".to_owned(),
+            net_value: -1_000,
+            fee: Some(10),
+            status: TransactionStatus {
+                confirmed: true,
+                block_height: Some(99),
+                block_time: Some(1),
+            },
+            confirmations: 2,
+        });
+
+        assert_eq!(
+            transaction_confirmation_text("missing", Some(&summary)),
+            None
+        );
+        assert_eq!(
+            transaction_confirmation_text("pending", Some(&summary)).as_deref(),
+            Some("Pending in the mempool; it is not confirmed yet.")
+        );
+        assert_eq!(
+            transaction_confirmation_text("confirmed", Some(&summary)).as_deref(),
+            Some("Confirmed in block #99 with 2 confirmations.")
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Aggregation of per-address testnet chain data for the wallet UI.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bitsabi_shared::{TransactionStatus, WalletSnapshot, WalletTransaction};
 
@@ -107,6 +107,7 @@ impl WalletSummary {
         let mut confirmed_sat = 0_i64;
         let mut pending_sat = 0_i64;
         let mut utxos = Vec::new();
+        let mut seen_utxos = HashSet::new();
         let mut history_truncated = false;
 
         for address in &snapshot.addresses {
@@ -120,10 +121,14 @@ impl WalletSummary {
             ));
             history_truncated |= address.history_truncated;
 
-            utxos.extend(address.utxos.iter().cloned().map(|utxo| AddressUtxo {
-                address: address.address.clone(),
-                utxo,
-            }));
+            for utxo in &address.utxos {
+                if seen_utxos.insert((utxo.txid.as_str(), utxo.vout)) {
+                    utxos.push(AddressUtxo {
+                        address: address.address.clone(),
+                        utxo: utxo.clone(),
+                    });
+                }
+            }
         }
 
         let total_sat = confirmed_sat.saturating_add(pending_sat);
@@ -380,6 +385,26 @@ mod tests {
         assert_eq!(format_block_time(0), "1970-01-01 00:00 UTC");
         assert_eq!(format_block_time(1_700_000_000), "2023-11-14 22:13 UTC");
         assert_eq!(format_block_time(1_704_067_199), "2023-12-31 23:59 UTC");
+    }
+
+    #[test]
+    fn duplicate_utxos_are_only_included_once() {
+        let utxo = WalletUtxo {
+            txid: "1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+            vout: 0,
+            value: 100,
+            status: TransactionStatus {
+                confirmed: true,
+                block_height: Some(1),
+                block_time: Some(1),
+            },
+        };
+        let summary = WalletSummary::from_snapshot(&snapshot(vec![
+            address_snapshot("a", 100, 0, 0, 0, vec![], vec![utxo.clone()]),
+            address_snapshot("b", 100, 0, 0, 0, vec![], vec![utxo]),
+        ]));
+
+        assert_eq!(summary.utxos.len(), 1);
     }
 
     #[test]

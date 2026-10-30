@@ -75,8 +75,9 @@ refresh.
 - Proxy only public testnet chain data through the API.
 - Validate addresses and network before building or broadcasting a transaction.
 - Show recovery-phrase warnings before wallet creation.
-- Add a persistent, encrypted wallet only in a dedicated milestone with a
-  documented key-storage design.
+- Persistent, encrypted wallet storage is available in this browser using Argon2id
+  key derivation and AES-256-GCM. The password is never stored; losing it means
+  losing access to the saved wallet.
 
 ## Known browser-wallet limitations
 
@@ -106,3 +107,28 @@ Before real funds are supported, BitSabi needs:
 
 Do not open a public issue for a suspected secret leak or wallet vulnerability.
 Report it privately to the project maintainers.
+
+## Persistent encrypted wallet storage
+
+BitSabi can optionally save a testnet wallet in this browser in encrypted form.
+
+- Key derivation uses Argon2id with 19 MiB memory, 2 iterations, and
+  parallelism 1. These values are a browser-friendly trade-off between offline
+  guessing resistance and interactive unlock latency.
+- The derived key encrypts the wallet seed with AES-256-GCM. The authentication
+  tag rejects modified or corrupted ciphertext.
+- Salt and nonce are generated with `getrandom` configured for the browser WASM
+  target, which uses the browser's cryptographically secure random source.
+- Only the encrypted envelope is written to localStorage. Passwords, recovery
+  phrases, seeds, and private keys are not stored there.
+- Unlocking requires the user's password. An incorrect password or corrupted
+  storage fails without exposing secrets.
+- Saving, unlocking, and removing a saved wallet require explicit user actions.
+- Losing the password means losing access to the saved wallet; BitSabi cannot
+  recover it.
+- The recovery phrase remains the primary backup. Users must back it up
+  separately.
+- Browser compromise, malicious extensions, XSS, or device compromise can still
+  expose secrets while the wallet is unlocked or in memory.
+- This remains testnet-only practice. It is not production-ready, independently
+  audited, or completely secure.

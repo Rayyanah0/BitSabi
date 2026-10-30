@@ -19,6 +19,7 @@ Wallet persistence and NGN payment quotes are not implemented yet.
 - Home dashboard with real progress and a clear next lesson.
 - Five lessons with reading views, one quiz per lesson, and device-local progress.
 - Testnet wallet creation with 12 secure recovery words and BIP84 address derivation.
+- Optional encrypted wallet persistence in this browser using a password-derived key.
 - Testnet wallet import with local 12/24-word BIP39 validation.
 - A receiving-address dashboard with QR code, clipboard copy, and testnet warnings.
 - Live testnet balances in BTC and sats: confirmed, unconfirmed, and total.
@@ -31,7 +32,7 @@ Wallet persistence and NGN payment quotes are not implemented yet.
 ## What is not implemented
 
 - Server-side progress sync; lesson progress is stored in this browser only.
-- Persistent wallets, wallet balances cached across refreshes, or authentication.
+- Wallet balances cached across refreshes, or authentication. (Encrypted testnet wallet persistence is available; balances are still fetched live.)
 - Real or mock BTC/NGN quotes.
 - PostgreSQL and payment-provider integration.
 

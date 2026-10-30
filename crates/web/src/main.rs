@@ -12,6 +12,7 @@ mod pages;
 mod routes;
 pub mod wallet;
 pub mod wallet_data;
+pub mod wallet_persistence;
 
 use education::provide_progress;
 use routes::Route;

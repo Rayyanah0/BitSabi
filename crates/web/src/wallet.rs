@@ -4,7 +4,11 @@
 //! zeroized when the wallet session is dropped; browser memory cannot be
 //! guaranteed to be fully erased.
 
-use std::{fmt, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    str::FromStr,
+};
 
 use bip39::{Error as Bip39Error, Mnemonic};
 use bitcoin::{
@@ -20,7 +24,7 @@ use bitcoin::{
     Transaction, TxIn, TxOut, Txid, Witness,
 };
 use bitsabi_shared::WalletUtxo;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(test)]
 const CREATED_WORD_COUNT: usize = 12;
@@ -178,6 +182,19 @@ impl AddressBranch {
     }
 }
 
+/// Best-effort zeroization wrapper for an extended private key.
+///
+/// Browser memory is not guaranteed to be fully erased.
+struct SecretXpriv(Xpriv);
+
+impl Drop for SecretXpriv {
+    fn drop(&mut self) {
+        self.0.private_key.non_secure_erase();
+        let chain_code: &mut [u8] = self.0.chain_code.as_mut();
+        chain_code.zeroize();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DerivedAddress {
     branch: AddressBranch,
@@ -218,17 +235,33 @@ impl WalletSession {
         Self::from_seed(seed)
     }
 
+    /// Restore a session from raw BIP39 seed bytes.
+    pub fn from_seed_bytes(seed: &[u8]) -> Result<Self, WalletError> {
+        if seed.len() != 64 {
+            return Err(WalletError::KeyDerivationFailed);
+        }
+        Self::from_seed(Zeroizing::new(seed.to_vec()))
+    }
+
+    /// Raw BIP39 seed bytes for encrypted persistence.
+    #[must_use]
+    pub fn export_seed(&self) -> Zeroizing<Vec<u8>> {
+        self.seed.clone()
+    }
+
     fn from_seed(seed: Zeroizing<Vec<u8>>) -> Result<Self, WalletError> {
         let secp = Secp256k1::new();
-        let master = Xpriv::new_master(NetworkKind::Test, &seed[..])
-            .map_err(|_| WalletError::KeyDerivationFailed)?;
+        let master = SecretXpriv(
+            Xpriv::new_master(NetworkKind::Test, &seed[..])
+                .map_err(|_| WalletError::KeyDerivationFailed)?,
+        );
 
         let mut receive_addresses = Vec::with_capacity(RECEIVE_GAP_LIMIT as usize);
         let mut change_addresses = Vec::with_capacity(CHANGE_GAP_LIMIT as usize);
 
         for index in 0..RECEIVE_GAP_LIMIT {
             receive_addresses.push(derive_address(
-                &master,
+                &master.0,
                 &secp,
                 AddressBranch::Receive,
                 index,
@@ -236,7 +269,7 @@ impl WalletSession {
         }
         for index in 0..CHANGE_GAP_LIMIT {
             change_addresses.push(derive_address(
-                &master,
+                &master.0,
                 &secp,
                 AddressBranch::Change,
                 index,
@@ -289,10 +322,12 @@ impl WalletSession {
 
     fn extend_receive_address(&mut self, index: u32) -> Result<(), WalletError> {
         let secp = Secp256k1::new();
-        let master = Xpriv::new_master(NetworkKind::Test, &self.seed[..])
-            .map_err(|_| WalletError::KeyDerivationFailed)?;
+        let master = SecretXpriv(
+            Xpriv::new_master(NetworkKind::Test, &self.seed[..])
+                .map_err(|_| WalletError::KeyDerivationFailed)?,
+        );
         self.receive_addresses.push(derive_address(
-            &master,
+            &master.0,
             &secp,
             AddressBranch::Receive,
             index,
@@ -314,21 +349,26 @@ impl WalletSession {
         &self.change_addresses[self.next_change_index]
     }
 
-    /// Mark the current change address as used after a successful broadcast.
-    pub fn record_change_used(&mut self) -> Result<(), WalletError> {
-        self.next_change_index += 1;
-        if self.next_change_index >= self.change_addresses.len() {
-            let secp = Secp256k1::new();
-            let master = Xpriv::new_master(NetworkKind::Test, &self.seed[..])
-                .map_err(|_| WalletError::KeyDerivationFailed)?;
-            let index = self.change_addresses.len() as u32;
-            self.change_addresses.push(derive_address(
-                &master,
-                &secp,
-                AddressBranch::Change,
-                index,
-            )?);
+    /// Mark a change address as used, advancing the change gap only once per
+    /// address. Retried broadcasts reuse their original change address, so this
+    /// is idempotent for a given address.
+    pub fn record_change_used(&mut self, address: &str) -> Result<(), WalletError> {
+        if self.next_change_address().address != address {
+            return Ok(());
         }
+
+        let next_index = self.next_change_index + 1;
+        if next_index >= self.change_addresses.len() {
+            let secp = Secp256k1::new();
+            let master = SecretXpriv(
+                Xpriv::new_master(NetworkKind::Test, &self.seed[..])
+                    .map_err(|_| WalletError::KeyDerivationFailed)?,
+            );
+            let index = self.change_addresses.len() as u32;
+            let derived = derive_address(&master.0, &secp, AddressBranch::Change, index)?;
+            self.change_addresses.push(derived);
+        }
+        self.next_change_index = next_index;
         Ok(())
     }
 
@@ -336,6 +376,12 @@ impl WalletSession {
         self.receive_addresses
             .iter()
             .chain(self.change_addresses.iter())
+            .find(|candidate| candidate.address == address)
+    }
+
+    fn owned_change_address(&self, address: &str) -> Option<&DerivedAddress> {
+        self.change_addresses
+            .iter()
             .find(|candidate| candidate.address == address)
     }
 }
@@ -567,20 +613,40 @@ pub fn plan_send(
         return Err(WalletError::InvalidAmount);
     }
 
-    let mut candidates = utxos
-        .iter()
-        .filter(|entry| entry.utxo.status.confirmed)
-        .filter_map(|entry| {
-            session
-                .owned_address(&entry.address)
-                .map(|owned| SendInput {
-                    utxo: entry.utxo.clone(),
-                    branch: owned.branch,
-                    index: owned.index,
-                    script_pubkey: owned.script_pubkey.clone(),
-                })
-        })
-        .collect::<Vec<_>>();
+    let max_money = Amount::MAX_MONEY.to_sat();
+    let mut seen: HashMap<(Txid, u32), (u64, ScriptBuf)> = HashMap::new();
+    let mut candidates = Vec::new();
+
+    for entry in utxos {
+        if !entry.utxo.status.confirmed {
+            continue;
+        }
+        let Some(owned) = session.owned_address(&entry.address) else {
+            continue;
+        };
+        let txid = Txid::from_str(&entry.utxo.txid).map_err(|_| WalletError::TransactionFailed)?;
+        if entry.utxo.value == 0 || entry.utxo.value > max_money {
+            return Err(WalletError::TransactionFailed);
+        }
+
+        let key = (txid, entry.utxo.vout);
+        if let Some((value, script_pubkey)) = seen.get(&key) {
+            if *value != entry.utxo.value || script_pubkey != &owned.script_pubkey {
+                return Err(WalletError::TransactionFailed);
+            }
+            continue;
+        }
+        seen.insert(key, (entry.utxo.value, owned.script_pubkey.clone()));
+
+        let mut utxo = entry.utxo.clone();
+        utxo.txid = txid.to_string();
+        candidates.push(SendInput {
+            utxo,
+            branch: owned.branch,
+            index: owned.index,
+            script_pubkey: owned.script_pubkey.clone(),
+        });
+    }
 
     let available_sat = candidates
         .iter()
@@ -672,25 +738,70 @@ pub fn sign_send_plan(
     session: &WalletSession,
     plan: &SendPlan,
 ) -> Result<SignedTransaction, WalletError> {
-    if plan.inputs.is_empty() || plan.amount_sat == 0 || plan.input_count != plan.inputs.len() {
+    if plan.inputs.is_empty()
+        || plan.amount_sat == 0
+        || plan.input_count != plan.inputs.len()
+        || !(1..=MAX_FEE_RATE_SAT_VB).contains(&plan.fee_rate_sat_vb)
+    {
         return Err(WalletError::TransactionFailed);
     }
 
     let recipient = validate_recipient(&plan.recipient)?;
+    let recipient_script = recipient.script_pubkey();
+    let recipient_dust = recipient_script.minimal_non_dust().to_sat();
+    if plan.amount_sat < recipient_dust {
+        return Err(WalletError::AmountBelowDust {
+            minimum_sat: recipient_dust,
+        });
+    }
+
+    let max_money = Amount::MAX_MONEY.to_sat();
+    if plan.amount_sat > max_money {
+        return Err(WalletError::InvalidAmount);
+    }
+
+    let mut total_input_sat = 0_u64;
+    let mut seen_inputs = HashSet::with_capacity(plan.inputs.len());
+    for input in &plan.inputs {
+        if input.utxo.value == 0 || input.utxo.value > max_money {
+            return Err(WalletError::TransactionFailed);
+        }
+        let txid = Txid::from_str(&input.utxo.txid).map_err(|_| WalletError::TransactionFailed)?;
+        if !seen_inputs.insert((txid, input.utxo.vout)) {
+            return Err(WalletError::TransactionFailed);
+        }
+        total_input_sat = total_input_sat
+            .checked_add(input.utxo.value)
+            .ok_or(WalletError::TransactionFailed)?;
+    }
+    if total_input_sat != plan.total_input_sat {
+        return Err(WalletError::TransactionFailed);
+    }
+
     let mut outputs = vec![TxOut {
         value: Amount::from_sat(plan.amount_sat),
-        script_pubkey: recipient.script_pubkey(),
+        script_pubkey: recipient_script.clone(),
     }];
     if plan.change_sat > 0 {
+        if plan.change_sat > max_money {
+            return Err(WalletError::TransactionFailed);
+        }
         let change_address = plan
             .change_address
             .as_deref()
             .ok_or(WalletError::TransactionFailed)?;
-        let change_address = validate_recipient(change_address)?;
+        let change = session
+            .owned_change_address(change_address)
+            .ok_or(WalletError::TransactionFailed)?;
+        if plan.change_sat < change.script_pubkey.minimal_non_dust().to_sat() {
+            return Err(WalletError::TransactionFailed);
+        }
         outputs.push(TxOut {
             value: Amount::from_sat(plan.change_sat),
-            script_pubkey: change_address.script_pubkey(),
+            script_pubkey: change.script_pubkey.clone(),
         });
+    } else if plan.change_address.is_some() {
+        return Err(WalletError::TransactionFailed);
     }
 
     let total_output = outputs
@@ -704,6 +815,18 @@ pub fn sign_send_plan(
         .checked_sub(total_output)
         .ok_or(WalletError::TransactionFailed)?;
     if expected_fee != plan.fee_sat {
+        return Err(WalletError::TransactionFailed);
+    }
+
+    let expected_vsize = estimated_vsize(
+        plan.inputs.len(),
+        recipient_script.len(),
+        plan.change_sat > 0,
+    );
+    if expected_vsize != plan.vsize || plan.vsize == 0 {
+        return Err(WalletError::TransactionFailed);
+    }
+    if plan.fee_sat < fee_for_size(plan.vsize, plan.fee_rate_sat_vb)? {
         return Err(WalletError::TransactionFailed);
     }
 
@@ -729,8 +852,10 @@ pub fn sign_send_plan(
     };
 
     let secp = Secp256k1::new();
-    let master = Xpriv::new_master(NetworkKind::Test, &session.seed[..])
-        .map_err(|_| WalletError::KeyDerivationFailed)?;
+    let master = SecretXpriv(
+        Xpriv::new_master(NetworkKind::Test, &session.seed[..])
+            .map_err(|_| WalletError::KeyDerivationFailed)?,
+    );
 
     let witnesses = {
         let mut cache = SighashCache::new(&transaction);
@@ -738,10 +863,13 @@ pub fn sign_send_plan(
 
         for (index, input) in plan.inputs.iter().enumerate() {
             let path = derivation_path(input.branch, input.index)?;
-            let child = master
-                .derive_priv(&secp, &path)
-                .map_err(|_| WalletError::KeyDerivationFailed)?;
-            let public_key = child.private_key.public_key(&secp);
+            let child = SecretXpriv(
+                master
+                    .0
+                    .derive_priv(&secp, &path)
+                    .map_err(|_| WalletError::KeyDerivationFailed)?,
+            );
+            let public_key = child.0.private_key.public_key(&secp);
             let expected_script =
                 Address::p2wpkh(&CompressedPublicKey(public_key), Network::Testnet).script_pubkey();
             if expected_script != input.script_pubkey {
@@ -757,7 +885,9 @@ pub fn sign_send_plan(
                 )
                 .map_err(|_| WalletError::TransactionFailed)?;
             let message = Message::from_digest(sighash.to_byte_array());
-            let signature = secp.sign_ecdsa(&message, &child.private_key);
+            let signature = secp.sign_ecdsa(&message, &child.0.private_key);
+            secp.verify_ecdsa(&message, &signature, &public_key)
+                .map_err(|_| WalletError::TransactionFailed)?;
             let signature = EcdsaSignature {
                 signature,
                 sighash_type: EcdsaSighashType::All,
@@ -800,10 +930,12 @@ fn derive_address(
     index: u32,
 ) -> Result<DerivedAddress, WalletError> {
     let path = derivation_path(branch, index)?;
-    let child = master
-        .derive_priv(secp, &path)
-        .map_err(|_| WalletError::KeyDerivationFailed)?;
-    let public_key = child.private_key.public_key(secp);
+    let child = SecretXpriv(
+        master
+            .derive_priv(secp, &path)
+            .map_err(|_| WalletError::KeyDerivationFailed)?,
+    );
+    let public_key = child.0.private_key.public_key(secp);
     let address = Address::p2wpkh(&CompressedPublicKey(public_key), Network::Testnet);
 
     Ok(DerivedAddress {
@@ -841,12 +973,17 @@ fn derive_address_from_mnemonic(mnemonic: &Mnemonic) -> Result<String, WalletErr
     let secp = Secp256k1::new();
     let path = DerivationPath::from_str("m/84'/1'/0'/0/0")
         .map_err(|_| WalletError::KeyDerivationFailed)?;
-    let master = Xpriv::new_master(NetworkKind::Test, &seed[..])
-        .map_err(|_| WalletError::KeyDerivationFailed)?;
-    let child = master
-        .derive_priv(&secp, &path)
-        .map_err(|_| WalletError::KeyDerivationFailed)?;
-    let public_key = child.private_key.public_key(&secp);
+    let master = SecretXpriv(
+        Xpriv::new_master(NetworkKind::Test, &seed[..])
+            .map_err(|_| WalletError::KeyDerivationFailed)?,
+    );
+    let child = SecretXpriv(
+        master
+            .0
+            .derive_priv(&secp, &path)
+            .map_err(|_| WalletError::KeyDerivationFailed)?,
+    );
+    let public_key = child.0.private_key.public_key(&secp);
     let address = Address::p2wpkh(&CompressedPublicKey(public_key), Network::Testnet);
     Ok(address.to_string())
 }
@@ -909,11 +1046,15 @@ mod tests {
     }
 
     fn test_utxo(address: &str, value: u64) -> AddressUtxo {
+        test_utxo_at(address, TEST_TXID, 0, value)
+    }
+
+    fn test_utxo_at(address: &str, txid: &str, vout: u32, value: u64) -> AddressUtxo {
         AddressUtxo {
             address: address.to_owned(),
             utxo: WalletUtxo {
-                txid: TEST_TXID.to_owned(),
-                vout: 0,
+                txid: txid.to_owned(),
+                vout,
                 value,
                 status: bitsabi_shared::TransactionStatus {
                     confirmed: true,
@@ -1068,6 +1209,65 @@ mod tests {
     }
 
     #[test]
+    fn change_address_usage_is_idempotent() {
+        let mut session = test_session();
+        let utxo = test_utxo(TEST_PHRASE_12_ADDRESS, 100_000);
+        let first_change = plan_send(
+            &session,
+            std::slice::from_ref(&utxo),
+            TEST_PHRASE_12_ADDRESS,
+            50_000,
+            2,
+        )
+        .unwrap()
+        .change_address
+        .unwrap();
+
+        session.record_change_used(&first_change).unwrap();
+        let second_change = plan_send(
+            &session,
+            std::slice::from_ref(&utxo),
+            TEST_PHRASE_12_ADDRESS,
+            50_000,
+            2,
+        )
+        .unwrap()
+        .change_address
+        .unwrap();
+        assert_ne!(first_change, second_change);
+
+        session.record_change_used(&first_change).unwrap();
+        session
+            .record_change_used("tb1qnotownedbythiswallet")
+            .unwrap();
+        let retried_change = plan_send(&session, &[utxo], TEST_PHRASE_12_ADDRESS, 50_000, 2)
+            .unwrap()
+            .change_address
+            .unwrap();
+        assert_eq!(second_change, retried_change);
+    }
+
+    #[test]
+    fn exported_seed_restores_the_same_wallet_addresses() {
+        let session = test_session();
+        let expected_addresses = session.scan_addresses();
+        let expected_current = session.current_receive_address().address().to_owned();
+
+        let restored = WalletSession::from_seed_bytes(&session.export_seed()).unwrap();
+
+        assert_eq!(restored.scan_addresses(), expected_addresses);
+        assert_eq!(
+            restored.current_receive_address().address(),
+            expected_current
+        );
+    }
+
+    #[test]
+    fn seed_restoration_rejects_wrong_length() {
+        assert!(WalletSession::from_seed_bytes(&[0_u8; 32]).is_err());
+    }
+
+    #[test]
     fn btc_amount_parsing_is_exact() {
         assert_eq!(parse_btc_amount("0.0005").unwrap(), 50_000);
         assert_eq!(parse_btc_amount("1").unwrap(), 100_000_000);
@@ -1131,6 +1331,209 @@ mod tests {
     }
 
     #[test]
+    fn send_plan_deduplicates_utxos_and_rejects_conflicting_duplicates() {
+        let session = test_session();
+        let utxo = test_utxo(TEST_PHRASE_12_ADDRESS, 100_000);
+
+        let plan = plan_send(
+            &session,
+            &[utxo.clone(), utxo.clone()],
+            TEST_PHRASE_12_ADDRESS,
+            50_000,
+            2,
+        )
+        .unwrap();
+        assert_eq!(plan.input_count, 1);
+        assert_eq!(plan.total_input_sat, 100_000);
+
+        let mut conflicting = utxo.clone();
+        conflicting.utxo.value = 90_000;
+        assert_eq!(
+            plan_send(
+                &session,
+                &[utxo, conflicting],
+                TEST_PHRASE_12_ADDRESS,
+                50_000,
+                2,
+            ),
+            Err(WalletError::TransactionFailed)
+        );
+    }
+
+    #[test]
+    fn send_plan_rejects_malformed_utxos() {
+        let session = test_session();
+
+        let mut invalid_txid = test_utxo(TEST_PHRASE_12_ADDRESS, 100_000);
+        invalid_txid.utxo.txid = "not-a-txid".to_owned();
+        assert_eq!(
+            plan_send(&session, &[invalid_txid], TEST_PHRASE_12_ADDRESS, 50_000, 2,),
+            Err(WalletError::TransactionFailed)
+        );
+
+        let mut zero_value = test_utxo(TEST_PHRASE_12_ADDRESS, 100_000);
+        zero_value.utxo.value = 0;
+        assert_eq!(
+            plan_send(&session, &[zero_value], TEST_PHRASE_12_ADDRESS, 50_000, 2,),
+            Err(WalletError::TransactionFailed)
+        );
+
+        let mut too_large = test_utxo(TEST_PHRASE_12_ADDRESS, 100_000);
+        too_large.utxo.value = Amount::MAX_MONEY.to_sat() + 1;
+        assert_eq!(
+            plan_send(&session, &[too_large], TEST_PHRASE_12_ADDRESS, 50_000, 2,),
+            Err(WalletError::TransactionFailed)
+        );
+    }
+
+    #[test]
+    fn send_plan_uses_multiple_utxos_when_one_is_not_enough() {
+        let session = test_session();
+        let utxos = vec![
+            test_utxo_at(TEST_PHRASE_12_ADDRESS, TEST_TXID, 0, 40_000),
+            test_utxo_at(
+                TEST_PHRASE_12_ADDRESS,
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                1,
+                30_000,
+            ),
+        ];
+
+        let plan = plan_send(&session, &utxos, TEST_PHRASE_12_ADDRESS, 60_000, 2).unwrap();
+
+        assert_eq!(plan.input_count, 2);
+        assert_eq!(plan.total_input_sat, 70_000);
+        assert!(plan.change_sat > 0);
+    }
+
+    #[test]
+    fn send_plan_absorbs_dust_change_into_the_fee() {
+        let session = test_session();
+        let utxos = vec![test_utxo(TEST_PHRASE_12_ADDRESS, 50_200)];
+
+        let plan = plan_send(&session, &utxos, TEST_PHRASE_12_ADDRESS, 50_000, 1).unwrap();
+
+        assert_eq!(plan.change_sat, 0);
+        assert!(plan.change_address.is_none());
+        assert_eq!(plan.fee_sat, 200);
+        assert_eq!(plan.vsize, 110);
+    }
+
+    #[test]
+    fn send_plan_rejects_dust_amounts_and_out_of_range_values() {
+        let session = test_session();
+        let utxos = vec![test_utxo(TEST_PHRASE_12_ADDRESS, 100_000)];
+
+        assert!(matches!(
+            plan_send(&session, &utxos, TEST_PHRASE_12_ADDRESS, 1, 2),
+            Err(WalletError::AmountBelowDust { .. })
+        ));
+        assert_eq!(
+            plan_send(
+                &session,
+                &utxos,
+                TEST_PHRASE_12_ADDRESS,
+                Amount::MAX_MONEY.to_sat() + 1,
+                2,
+            ),
+            Err(WalletError::InvalidAmount)
+        );
+        assert_eq!(
+            plan_send(&session, &utxos, TEST_PHRASE_12_ADDRESS, 50_000, 1_001),
+            Err(WalletError::InvalidFeeRate)
+        );
+    }
+
+    #[test]
+    fn signing_rejects_tampered_plans() {
+        let session = test_session();
+        let utxos = vec![test_utxo(TEST_PHRASE_12_ADDRESS, 100_000)];
+        let plan = plan_send(&session, &utxos, TEST_PHRASE_12_ADDRESS, 50_000, 2).unwrap();
+
+        let mut external_change = plan.clone();
+        external_change.change_address = Some(TEST_PHRASE_12_ADDRESS.to_owned());
+        assert_eq!(
+            sign_send_plan(&session, &external_change),
+            Err(WalletError::TransactionFailed)
+        );
+
+        let mut wrong_fee = plan.clone();
+        wrong_fee.fee_sat += 1;
+        assert_eq!(
+            sign_send_plan(&session, &wrong_fee),
+            Err(WalletError::TransactionFailed)
+        );
+
+        let mut wrong_input_total = plan.clone();
+        wrong_input_total.total_input_sat += 1;
+        assert_eq!(
+            sign_send_plan(&session, &wrong_input_total),
+            Err(WalletError::TransactionFailed)
+        );
+
+        let mut dust_change = plan;
+        dust_change.change_sat = 1;
+        assert_eq!(
+            sign_send_plan(&session, &dust_change),
+            Err(WalletError::TransactionFailed)
+        );
+    }
+
+    #[test]
+    fn signing_rejects_duplicate_inputs() {
+        let session = test_session();
+        let utxos = vec![test_utxo(TEST_PHRASE_12_ADDRESS, 100_000)];
+        let plan = plan_send(&session, &utxos, TEST_PHRASE_12_ADDRESS, 50_000, 2).unwrap();
+
+        let mut duplicate_inputs = plan.clone();
+        duplicate_inputs
+            .inputs
+            .push(duplicate_inputs.inputs[0].clone());
+        duplicate_inputs.input_count = duplicate_inputs.inputs.len();
+        duplicate_inputs.total_input_sat *= 2;
+
+        assert_eq!(
+            sign_send_plan(&session, &duplicate_inputs),
+            Err(WalletError::TransactionFailed)
+        );
+    }
+
+    #[test]
+    fn signatures_verify_against_the_signed_sighashes() {
+        use bitcoin::PublicKey;
+
+        let session = test_session();
+        let utxos = vec![test_utxo(TEST_PHRASE_12_ADDRESS, 100_000)];
+        let plan = plan_send(&session, &utxos, TEST_PHRASE_12_ADDRESS, 50_000, 2).unwrap();
+        let signed = sign_send_plan(&session, &plan).unwrap();
+        let transaction: Transaction = deserialize_hex(&signed.raw_hex).unwrap();
+        let secp = Secp256k1::verification_only();
+
+        for (index, input) in plan.inputs.iter().enumerate() {
+            let witness = &transaction.input[index].witness;
+            assert_eq!(witness.len(), 2);
+            let signature = EcdsaSignature::from_slice(&witness[0]).unwrap();
+            let public_key = PublicKey::from_slice(&witness[1]).unwrap();
+            let sighash = SighashCache::new(&transaction)
+                .p2wpkh_signature_hash(
+                    index,
+                    &input.script_pubkey,
+                    Amount::from_sat(input.utxo.value),
+                    EcdsaSighashType::All,
+                )
+                .unwrap();
+
+            assert!(secp
+                .verify_ecdsa(
+                    &Message::from_digest(sighash.to_byte_array()),
+                    &signature.signature,
+                    &public_key.inner,
+                )
+                .is_ok());
+        }
+    }
+
+    #[test]
     fn send_plan_rejects_mainnet_recipients_and_bad_fee_rates() {
         let session = test_session();
         let utxos = vec![test_utxo(TEST_PHRASE_12_ADDRESS, 100_000)];
@@ -1166,11 +1569,21 @@ mod tests {
         assert_eq!(transaction.compute_txid().to_string(), signed.txid);
         assert_eq!(signed.fee_sat, plan.fee_sat);
         assert!(signed.vsize > 0);
+        assert!(signed.vsize <= plan.vsize);
+        assert!(signed.fee_sat >= signed.vsize * plan.fee_rate_sat_vb);
     }
 
     #[test]
     fn estimated_vsize_is_close_to_a_one_input_two_output_transaction() {
         assert_eq!(estimated_vsize(1, 22, true), 141);
         assert_eq!(estimated_vsize(1, 22, false), 110);
+    }
+
+    #[test]
+    fn fees_are_calculated_from_vsize_and_checked_for_overflow() {
+        assert_eq!(fee_for_size(141, 2).unwrap(), 282);
+        assert_eq!(fee_for_size(110, 1).unwrap(), 110);
+        assert!(fee_for_size(0, 1).is_err());
+        assert!(fee_for_size(u64::MAX, 2).is_err());
     }
 }

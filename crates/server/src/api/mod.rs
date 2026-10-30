@@ -4,7 +4,12 @@
 //! transactions. Wallet recovery phrases, seeds, and private keys never reach
 //! this API.
 
-use std::{collections::HashSet, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::{DefaultBodyLimit, State},
@@ -28,13 +33,121 @@ use crate::chain::{ChainClient, ChainError};
 
 /// Build the API router.
 pub fn router(chain: ChainClient) -> Router {
+    let state = AppState {
+        chain,
+        broadcasts: BroadcastTracker::default(),
+    };
+
     Router::new()
         .route("/api/health", get(health))
         .route("/api/testnet/wallet/snapshot", post(wallet_snapshot))
         .route("/api/testnet/broadcast", post(broadcast_transaction))
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(MAX_RAW_TRANSACTION_BYTES * 2 + 1024))
-        .with_state(chain)
+        .with_state(state)
+}
+
+#[derive(Clone)]
+struct AppState {
+    chain: ChainClient,
+    broadcasts: BroadcastTracker,
+}
+
+const BROADCAST_MEMORY: Duration = Duration::from_secs(10 * 60);
+const MAX_ACCEPTED_BROADCASTS: usize = 512;
+
+/// In-memory tracker for broadcast duplicate protection.
+///
+/// This only protects one running server process. It is not a database and does
+/// not provide permanent or cross-process duplicate protection.
+#[derive(Clone, Default)]
+struct BroadcastTracker {
+    inner: Arc<Mutex<BroadcastTrackerInner>>,
+}
+
+#[derive(Default)]
+struct BroadcastTrackerInner {
+    in_flight: HashSet<Txid>,
+    accepted: HashMap<Txid, Instant>,
+    uncertain: HashMap<Txid, Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BroadcastRegistration {
+    Start,
+    InFlight,
+    AlreadyAccepted,
+    Uncertain,
+}
+
+impl BroadcastTracker {
+    fn begin(&self, txid: Txid) -> BroadcastRegistration {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        inner
+            .accepted
+            .retain(|_, accepted_at| now.duration_since(*accepted_at) < BROADCAST_MEMORY);
+        inner
+            .uncertain
+            .retain(|_, recorded_at| now.duration_since(*recorded_at) < BROADCAST_MEMORY);
+
+        if inner.uncertain.contains_key(&txid) {
+            return BroadcastRegistration::Uncertain;
+        }
+        if inner.accepted.contains_key(&txid) {
+            return BroadcastRegistration::AlreadyAccepted;
+        }
+        if !inner.in_flight.insert(txid) {
+            return BroadcastRegistration::InFlight;
+        }
+
+        // Preserve protection for recent transactions by evicting only the oldest
+        // entries when the bounded cache is full.
+        while inner.accepted.len() >= MAX_ACCEPTED_BROADCASTS {
+            let oldest = inner
+                .accepted
+                .iter()
+                .min_by_key(|(_, accepted_at)| *accepted_at)
+                .map(|(txid, _)| *txid);
+            match oldest {
+                Some(txid) => {
+                    inner.accepted.remove(&txid);
+                }
+                None => break,
+            }
+        }
+
+        BroadcastRegistration::Start
+    }
+
+    fn succeeded(&self, txid: Txid) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.in_flight.remove(&txid);
+        inner.accepted.insert(txid, Instant::now());
+    }
+
+    fn failed(&self, txid: Txid) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.in_flight.remove(&txid);
+    }
+
+    fn uncertain(&self, txid: Txid) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.in_flight.remove(&txid);
+        inner.uncertain.insert(txid, Instant::now());
+    }
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -42,11 +155,12 @@ async fn health() -> Json<HealthResponse> {
 }
 
 async fn wallet_snapshot(
-    State(chain): State<ChainClient>,
+    State(state): State<AppState>,
     Json(request): Json<WalletSnapshotRequest>,
 ) -> Result<Json<WalletSnapshot>, ApiError> {
     let addresses = validate_addresses(&request.addresses)?;
-    let snapshot = chain
+    let snapshot = state
+        .chain
         .wallet_snapshot(&addresses)
         .await
         .map_err(ApiError::from)?;
@@ -54,21 +168,52 @@ async fn wallet_snapshot(
 }
 
 async fn broadcast_transaction(
-    State(chain): State<ChainClient>,
+    State(state): State<AppState>,
     Json(request): Json<BroadcastTransactionRequest>,
 ) -> Result<Json<BroadcastTransactionResponse>, ApiError> {
     let (raw_transaction, expected_txid) = validate_raw_transaction(&request.raw_transaction_hex)?;
-    let provider_txid = chain
-        .broadcast(&raw_transaction)
-        .await
-        .map_err(ApiError::from)?;
-    let provider_txid = Txid::from_str(provider_txid.trim())
-        .map_err(|_| ApiError::Chain(ChainError::InvalidResponse))?;
 
-    if provider_txid != expected_txid {
-        return Err(ApiError::Chain(ChainError::InvalidResponse));
+    match state.broadcasts.begin(expected_txid) {
+        BroadcastRegistration::AlreadyAccepted => {
+            return Ok(Json(BroadcastTransactionResponse {
+                txid: expected_txid.to_string(),
+            }));
+        }
+        BroadcastRegistration::InFlight => {
+            return Err(ApiError::InvalidRequest(
+                "This transaction is already being broadcast.".to_owned(),
+            ));
+        }
+        BroadcastRegistration::Start => {}
+        BroadcastRegistration::Uncertain => {
+            return Err(ApiError::Chain(ChainError::BroadcastOutcomeUncertain));
+        }
     }
 
+    let result = state.chain.broadcast(&raw_transaction).await;
+    let provider_txid = match result {
+        Ok(provider_txid) => provider_txid,
+        Err(ChainError::BroadcastRejected(message)) => {
+            state.broadcasts.failed(expected_txid);
+            return Err(ApiError::Chain(ChainError::BroadcastRejected(message)));
+        }
+        Err(_) => {
+            // A network or provider failure is not proof that the transaction was
+            // rejected; the provider may have accepted it before the response was
+            // lost. Mark it uncertain and prevent a blind retry.
+            state.broadcasts.uncertain(expected_txid);
+            return Err(ApiError::Chain(ChainError::BroadcastOutcomeUncertain));
+        }
+    };
+    let provider_txid = match Txid::from_str(provider_txid.trim()) {
+        Ok(provider_txid) if provider_txid == expected_txid => provider_txid,
+        _ => {
+            state.broadcasts.failed(expected_txid);
+            return Err(ApiError::Chain(ChainError::InvalidResponse));
+        }
+    };
+
+    state.broadcasts.succeeded(expected_txid);
     Ok(Json(BroadcastTransactionResponse {
         txid: provider_txid.to_string(),
     }))
@@ -146,6 +291,15 @@ fn validate_raw_transaction(raw_hex: &str) -> Result<(String, Txid), ApiError> {
             "Coinbase transactions cannot be broadcast.".to_owned(),
         ));
     }
+    if transaction
+        .input
+        .iter()
+        .any(|input| input.witness.is_empty() && input.script_sig.is_empty())
+    {
+        return Err(ApiError::InvalidRequest(
+            "The transaction has unsigned inputs.".to_owned(),
+        ));
+    }
     if serialize(&transaction).len() > MAX_RAW_TRANSACTION_BYTES {
         return Err(ApiError::InvalidRequest(
             "The signed transaction is too large.".to_owned(),
@@ -184,6 +338,11 @@ impl IntoResponse for ApiError {
             Self::Chain(ChainError::BroadcastRejected(message)) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, message)
             }
+            Self::Chain(ChainError::BroadcastOutcomeUncertain) => (
+                StatusCode::CONFLICT,
+                "The broadcast may have been accepted. Check the transaction status before retrying."
+                    .to_owned(),
+            ),
             Self::Chain(_) => (
                 StatusCode::BAD_GATEWAY,
                 "Testnet chain data is temporarily unavailable. Please try again.".to_owned(),
@@ -205,6 +364,8 @@ async fn not_found() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use axum::{
         body::Body,
         extract::Path,
@@ -238,13 +399,92 @@ mod tests {
                 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
+                witness: Witness::from_slice(&[vec![0_u8; 72], vec![2_u8; 33]]),
             }],
             output: vec![TxOut {
                 value: Amount::from_sat(1_000),
                 script_pubkey: ScriptBuf::new(),
             }],
         }
+    }
+
+    #[test]
+    fn broadcast_tracker_rejects_in_flight_and_repeated_submissions() {
+        let tracker = BroadcastTracker::default();
+        let txid =
+            Txid::from_str("1111111111111111111111111111111111111111111111111111111111111111")
+                .unwrap();
+
+        assert_eq!(tracker.begin(txid), BroadcastRegistration::Start);
+        assert_eq!(tracker.begin(txid), BroadcastRegistration::InFlight);
+
+        tracker.succeeded(txid);
+        assert_eq!(tracker.begin(txid), BroadcastRegistration::AlreadyAccepted);
+
+        tracker.failed(txid);
+        assert_eq!(tracker.begin(txid), BroadcastRegistration::AlreadyAccepted);
+    }
+
+    #[test]
+    fn failed_broadcasts_can_be_retried() {
+        let tracker = BroadcastTracker::default();
+        let txid =
+            Txid::from_str("2222222222222222222222222222222222222222222222222222222222222222")
+                .unwrap();
+
+        assert_eq!(tracker.begin(txid), BroadcastRegistration::Start);
+        tracker.failed(txid);
+        assert_eq!(tracker.begin(txid), BroadcastRegistration::Start);
+    }
+
+    #[test]
+    fn accepted_broadcast_capacity_evicts_oldest_entry() {
+        let tracker = BroadcastTracker::default();
+
+        for index in 0..MAX_ACCEPTED_BROADCASTS {
+            let txid = Txid::from_str(&format!("{:064x}", index + 1)).unwrap();
+            assert_eq!(tracker.begin(txid), BroadcastRegistration::Start);
+            tracker.succeeded(txid);
+        }
+
+        let oldest = Txid::from_str(&format!("{:064x}", 1)).unwrap();
+        let next = Txid::from_str(&format!("{:064x}", MAX_ACCEPTED_BROADCASTS + 1)).unwrap();
+        assert_eq!(tracker.begin(next), BroadcastRegistration::Start);
+        tracker.succeeded(next);
+
+        // The oldest accepted entry was evicted instead of clearing the cache.
+        assert_eq!(tracker.begin(oldest), BroadcastRegistration::Start);
+    }
+
+    #[test]
+    fn expired_accepted_entries_are_removed_before_capacity_checks() {
+        let tracker = BroadcastTracker::default();
+        let txid = Txid::from_str(&format!("{:064x}", 99)).unwrap();
+
+        assert_eq!(tracker.begin(txid), BroadcastRegistration::Start);
+        tracker.succeeded(txid);
+
+        {
+            let mut inner = tracker
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner
+                .accepted
+                .insert(txid, Instant::now() - BROADCAST_MEMORY);
+        }
+
+        assert_eq!(tracker.begin(txid), BroadcastRegistration::Start);
+    }
+
+    #[test]
+    fn duplicate_accepted_broadcasts_remain_protected() {
+        let tracker = BroadcastTracker::default();
+        let txid = Txid::from_str(&format!("{:064x}", 7)).unwrap();
+
+        assert_eq!(tracker.begin(txid), BroadcastRegistration::Start);
+        tracker.succeeded(txid);
+        assert_eq!(tracker.begin(txid), BroadcastRegistration::AlreadyAccepted);
     }
 
     #[test]
@@ -285,6 +525,14 @@ mod tests {
         let mut transaction = unsigned_transaction();
         transaction.output.clear();
         let raw_hex = serialize(&transaction)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert!(validate_raw_transaction(&raw_hex).is_err());
+
+        let mut unsigned = unsigned_transaction();
+        unsigned.input[0].witness = Witness::new();
+        let raw_hex = serialize(&unsigned)
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
@@ -340,7 +588,7 @@ mod tests {
     async fn snapshot_and_broadcast_use_the_configured_provider() {
         let transaction = unsigned_transaction();
         let txid = transaction.compute_txid().to_string();
-        let provider_url = spawn_mock_provider(txid.clone()).await;
+        let (provider_url, _broadcast_calls) = spawn_mock_provider(txid.clone()).await;
 
         let mut config = Config::for_test();
         config.testnet_api_url = provider_url;
@@ -393,6 +641,183 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_broadcasts_are_idempotent_and_do_not_reach_the_provider_twice() {
+        let transaction = unsigned_transaction();
+        let txid = transaction.compute_txid().to_string();
+        let (provider_url, calls) = spawn_mock_provider(txid.clone()).await;
+
+        let mut config = Config::for_test();
+        config.testnet_api_url = provider_url;
+        let app = crate::app(&config);
+
+        let raw_hex = serialize(&transaction)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let body = serde_json::json!({ "raw_transaction_hex": raw_hex }).to_string();
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/testnet/broadcast")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let broadcast: BroadcastTransactionResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(broadcast.txid, txid);
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_rejections_are_reported_without_false_success() {
+        let transaction = unsigned_transaction();
+        let txid = transaction.compute_txid().to_string();
+        let (provider_url, calls) = spawn_mock_provider_with(
+            txid,
+            Some((
+                StatusCode::BAD_REQUEST,
+                "bad-txns-inputs-missingorspent".to_owned(),
+            )),
+        )
+        .await;
+
+        let mut config = Config::for_test();
+        config.testnet_api_url = provider_url;
+        let app = crate::app(&config);
+
+        let raw_hex = serialize(&transaction)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let body = serde_json::json!({ "raw_transaction_hex": raw_hex }).to_string();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/testnet/broadcast")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let error: ApiErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(error.error.contains("missingorspent"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn mismatched_provider_transaction_ids_are_not_accepted() {
+        let transaction = unsigned_transaction();
+        let txid = transaction.compute_txid().to_string();
+        let different_txid =
+            "3333333333333333333333333333333333333333333333333333333333333333".to_owned();
+        let (provider_url, _calls) = spawn_mock_provider(different_txid.clone()).await;
+
+        let mut config = Config::for_test();
+        config.testnet_api_url = provider_url;
+        let app = crate::app(&config);
+
+        let raw_hex = serialize(&transaction)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let body = serde_json::json!({ "raw_transaction_hex": raw_hex }).to_string();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/testnet/broadcast")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_ne!(txid, different_txid);
+    }
+
+    #[tokio::test]
+    async fn uncertain_provider_outcomes_are_not_reported_as_rejections() {
+        let transaction = unsigned_transaction();
+        let txid = transaction.compute_txid().to_string();
+        let (provider_url, _calls) = spawn_mock_provider_with(
+            txid,
+            Some((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "provider unavailable".to_owned(),
+            )),
+        )
+        .await;
+
+        let mut config = Config::for_test();
+        config.testnet_api_url = provider_url;
+        let app = crate::app(&config);
+
+        let raw_hex = serialize(&transaction)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let body = serde_json::json!({ "raw_transaction_hex": raw_hex }).to_string();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/testnet/broadcast")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let error: ApiErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(error.error.contains("may have been accepted"));
+    }
+
+    #[test]
+    fn uncertain_broadcasts_are_not_retried_blindly() {
+        let tracker = BroadcastTracker::default();
+        let txid =
+            Txid::from_str("4444444444444444444444444444444444444444444444444444444444444444")
+                .unwrap();
+
+        assert_eq!(tracker.begin(txid), BroadcastRegistration::Start);
+        tracker.uncertain(txid);
+        assert_eq!(tracker.begin(txid), BroadcastRegistration::Uncertain);
+    }
+
+    #[test]
+    fn rejected_broadcasts_release_in_flight_registration() {
+        let tracker = BroadcastTracker::default();
+        let txid =
+            Txid::from_str("5555555555555555555555555555555555555555555555555555555555555555")
+                .unwrap();
+
+        assert_eq!(tracker.begin(txid), BroadcastRegistration::Start);
+        tracker.failed(txid);
+        assert_eq!(tracker.begin(txid), BroadcastRegistration::Start);
+    }
+
+    #[tokio::test]
     async fn unknown_route_returns_json_404() {
         let config = Config::for_test();
         let response = crate::app(&config)
@@ -408,7 +833,21 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    async fn spawn_mock_provider(txid: String) -> String {
+    #[derive(Clone)]
+    struct MockProviderState {
+        txid: String,
+        calls: Arc<AtomicUsize>,
+        response: Option<(StatusCode, String)>,
+    }
+
+    async fn spawn_mock_provider(txid: String) -> (String, Arc<AtomicUsize>) {
+        spawn_mock_provider_with(txid, None).await
+    }
+
+    async fn spawn_mock_provider_with(
+        txid: String,
+        response: Option<(StatusCode, String)>,
+    ) -> (String, Arc<AtomicUsize>) {
         async fn stats() -> Json<serde_json::Value> {
             Json(serde_json::json!({
                 "chain_stats": { "funded_txo_sum": 50_000, "spent_txo_sum": 10_000, "tx_count": 1 },
@@ -450,10 +889,15 @@ mod tests {
             "850000"
         }
 
-        async fn broadcast(State(txid): State<String>) -> String {
-            txid
+        async fn broadcast(State(state): State<MockProviderState>) -> Response {
+            state.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((status, body)) = state.response {
+                return (status, body).into_response();
+            }
+            (StatusCode::OK, state.txid).into_response()
         }
 
+        let calls = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
             .route("/address/{address}", get(stats))
             .route("/address/{address}/utxo", get(utxos))
@@ -461,7 +905,11 @@ mod tests {
             .route("/fee-estimates", get(fees))
             .route("/blocks/tip/height", get(tip))
             .route("/tx", post(broadcast))
-            .with_state(txid);
+            .with_state(MockProviderState {
+                txid,
+                calls: Arc::clone(&calls),
+                response,
+            });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -469,6 +917,6 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        format!("http://{address}")
+        (format!("http://{address}"), calls)
     }
 }

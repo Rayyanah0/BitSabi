@@ -5,11 +5,13 @@
 //! transactions.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
+    str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use bitcoin::{Amount, Txid};
 use bitsabi_shared::{
     AddressSnapshot, AddressStats, AddressStatsSet, FeeEstimates, TransactionStatus,
     WalletSnapshot, WalletTransaction, WalletUtxo,
@@ -161,20 +163,7 @@ impl ChainClient {
 
     async fn address_utxos(&self, address: &str) -> Result<Vec<WalletUtxo>, ChainError> {
         let utxos: Vec<EsploraUtxo> = self.get_json(&format!("/address/{address}/utxo")).await?;
-
-        Ok(utxos
-            .into_iter()
-            .map(|utxo| WalletUtxo {
-                txid: utxo.txid,
-                vout: utxo.vout,
-                value: utxo.value,
-                status: TransactionStatus {
-                    confirmed: utxo.status.confirmed,
-                    block_height: utxo.status.block_height,
-                    block_time: utxo.status.block_time,
-                },
-            })
-            .collect())
+        parse_utxos(utxos)
     }
 
     async fn address_transactions(
@@ -332,6 +321,9 @@ pub enum ChainError {
     /// Provider rejected a signed transaction.
     #[error("{0}")]
     BroadcastRejected(String),
+    /// The broadcast may have been accepted, but the outcome could not be confirmed.
+    #[error("the broadcast outcome could not be confirmed")]
+    BroadcastOutcomeUncertain,
 }
 
 #[derive(Debug, Deserialize)]
@@ -366,7 +358,7 @@ impl From<EsploraAddressStats> for AddressStatsSet {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct EsploraUtxo {
     txid: String,
     vout: u32,
@@ -399,6 +391,43 @@ struct EsploraVin {
 struct EsploraVout {
     scriptpubkey_address: Option<String>,
     value: u64,
+}
+
+fn parse_utxos(raw_utxos: Vec<EsploraUtxo>) -> Result<Vec<WalletUtxo>, ChainError> {
+    let max_money = Amount::MAX_MONEY.to_sat();
+    let mut seen: HashMap<(Txid, u32), WalletUtxo> = HashMap::with_capacity(raw_utxos.len());
+    let mut utxos = Vec::with_capacity(raw_utxos.len());
+
+    for utxo in raw_utxos {
+        let txid = Txid::from_str(&utxo.txid).map_err(|_| ChainError::InvalidResponse)?;
+        if utxo.value == 0 || utxo.value > max_money {
+            return Err(ChainError::InvalidResponse);
+        }
+
+        let utxo = WalletUtxo {
+            txid: txid.to_string(),
+            vout: utxo.vout,
+            value: utxo.value,
+            status: TransactionStatus {
+                confirmed: utxo.status.confirmed,
+                block_height: utxo.status.block_height,
+                block_time: utxo.status.block_time,
+            },
+        };
+        let key = (txid, utxo.vout);
+
+        if let Some(existing) = seen.get(&key) {
+            if existing != &utxo {
+                return Err(ChainError::InvalidResponse);
+            }
+            continue;
+        }
+
+        seen.insert(key, utxo.clone());
+        utxos.push(utxo);
+    }
+
+    Ok(utxos)
 }
 
 fn transaction_for_address(
@@ -693,6 +722,108 @@ mod tests {
         assert_eq!(transaction.net_value, -6_000);
         assert_eq!(transaction.fee, Some(150));
         assert!(!transaction.status.confirmed);
+    }
+
+    #[test]
+    fn utxos_are_validated_and_deduplicated() {
+        let utxo = EsploraUtxo {
+            txid: "1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+            vout: 1,
+            value: 40_000,
+            status: EsploraStatus {
+                confirmed: true,
+                block_height: Some(849_990),
+                block_time: Some(1_700_000_000),
+            },
+        };
+
+        let parsed = parse_utxos(vec![utxo.clone()]).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].txid.len(), 64);
+        assert_eq!(parsed[0].value, 40_000);
+        assert!(parsed[0].status.confirmed);
+
+        let duplicate = EsploraUtxo {
+            txid: "1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+            vout: 1,
+            value: 40_000,
+            status: EsploraStatus {
+                confirmed: true,
+                block_height: Some(849_990),
+                block_time: Some(1_700_000_000),
+            },
+        };
+        assert_eq!(parse_utxos(vec![utxo, duplicate]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn malformed_utxos_are_rejected() {
+        let valid = EsploraUtxo {
+            txid: "1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+            vout: 0,
+            value: 40_000,
+            status: EsploraStatus::default(),
+        };
+
+        let mut invalid_txid = valid.clone();
+        invalid_txid.txid = "not-a-txid".to_owned();
+        assert!(matches!(
+            parse_utxos(vec![invalid_txid]),
+            Err(ChainError::InvalidResponse)
+        ));
+
+        let mut zero_value = valid.clone();
+        zero_value.value = 0;
+        assert!(matches!(
+            parse_utxos(vec![zero_value]),
+            Err(ChainError::InvalidResponse)
+        ));
+
+        let mut too_large = valid;
+        too_large.value = Amount::MAX_MONEY.to_sat() + 1;
+        assert!(matches!(
+            parse_utxos(vec![too_large]),
+            Err(ChainError::InvalidResponse)
+        ));
+    }
+
+    #[test]
+    fn conflicting_duplicate_utxos_are_rejected() {
+        let first = EsploraUtxo {
+            txid: "1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+            vout: 0,
+            value: 40_000,
+            status: EsploraStatus::default(),
+        };
+        let conflicting = EsploraUtxo {
+            txid: "1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+            vout: 0,
+            value: 50_000,
+            status: EsploraStatus::default(),
+        };
+
+        assert!(matches!(
+            parse_utxos(vec![first, conflicting]),
+            Err(ChainError::InvalidResponse)
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_utxo_responses_are_reported() {
+        let mut mock = MockProvider::healthy();
+        mock.utxos = serde_json::json!([{
+            "txid": "not-a-txid",
+            "vout": 0,
+            "value": 40_000,
+            "status": { "confirmed": true }
+        }])
+        .to_string();
+        let url = spawn_provider(mock).await;
+        let client = ChainClient::new(&url, None);
+
+        let result = client.wallet_snapshot(&[TESTNET_ADDRESS.to_owned()]).await;
+
+        assert!(matches!(result, Err(ChainError::InvalidResponse)));
     }
 
     #[test]
