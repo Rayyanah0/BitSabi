@@ -37,17 +37,17 @@ pub fn Settings() -> Element {
                 section { class: "settings-card",
                     h2 { "Wallet and network" }
                     p {
-                        "Wallet features are not enabled yet. When they arrive, BitSabi will use Bitcoin testnet only and keep keys inside your browser."
+                        "BitSabi's wallet uses Bitcoin testnet and processes wallet secrets only inside your browser. Recovery phrases are never sent to the API."
                     }
                     div { class: "settings-card__row",
                         span { "Network" }
-                        strong { "Testnet planned" }
+                        strong { "Bitcoin testnet" }
                     }
                     div { class: "settings-card__row",
                         span { "Wallet status" }
-                        strong { "Not enabled" }
+                        strong { "Create and import" }
                     }
-                    Link { class: "text-link", to: Route::Wallet {}, "View the wallet plan" }
+                    Link { class: "text-link", to: Route::Wallet {}, "Open the testnet wallet" }
                 }
 
                 section { class: "settings-card",
@@ -61,7 +61,7 @@ pub fn Settings() -> Element {
                         strong { "Never sent to the API" }
                     }
                     p { class: "settings-card__note",
-                        "A browser wallet cannot remove every risk. We will document its limits before any real-money use."
+                        "This browser wallet is for testnet only. Real-money use would require an independent security review."
                     }
                 }
 

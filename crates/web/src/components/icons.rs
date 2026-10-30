@@ -228,3 +228,92 @@ pub fn CheckIcon() -> Element {
         }
     }
 }
+
+#[component]
+pub fn CopyIcon() -> Element {
+    rsx! {
+        svg {
+            class: "icon",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.8",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            rect { x: "8", y: "8", width: "11", height: "12", rx: "2" }
+            path { d: "M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2" }
+        }
+    }
+}
+
+#[component]
+pub fn ImportIcon() -> Element {
+    rsx! {
+        svg {
+            class: "icon",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.8",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: "M12 3.5v11M7.5 10l4.5 4.5 4.5-4.5" }
+            path { d: "M5 15.5v3A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5v-3" }
+        }
+    }
+}
+
+#[component]
+pub fn WarningIcon() -> Element {
+    rsx! {
+        svg {
+            class: "icon",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.8",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: "M12 4.2 21 20H3L12 4.2Z" }
+            path { d: "M12 9.5v4.5" }
+            path { d: "M12 17.2h.01" }
+        }
+    }
+}
+
+#[component]
+pub fn RefreshIcon() -> Element {
+    rsx! {
+        svg {
+            class: "icon",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.8",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: "M4.5 9.5A8 8 0 0 1 19 7l1.5 2.5" }
+            path { d: "M20.5 4v5.5H15" }
+            path { d: "M19.5 14.5A8 8 0 0 1 5 17l-1.5-2.5" }
+            path { d: "M3.5 20v-5.5H9" }
+        }
+    }
+}
+
+#[component]
+pub fn ExternalLinkIcon() -> Element {
+    rsx! {
+        svg {
+            class: "icon",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.8",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: "M13 5h6v6" }
+            path { d: "M19 5 10 14" }
+            path { d: "M18 14.5V18a1.5 1.5 0 0 1-1.5 1.5H6A1.5 1.5 0 0 1 4.5 18V7.5A1.5 1.5 0 0 1 6 6h3.5" }
+        }
+    }
+}

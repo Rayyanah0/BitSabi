@@ -1,14 +1,17 @@
 //! BitSabi browser app.
 //!
-//! The wallet will live entirely in this WebAssembly app in a later milestone.
-//! No recovery phrase or private key may ever be sent to the API.
+//! The testnet wallet runs entirely in this WebAssembly app.
+//! No recovery phrase, seed, or private key may ever be sent to the API.
 
 use dioxus::prelude::*;
 
+mod api;
 mod components;
 mod education;
 mod pages;
 mod routes;
+pub mod wallet;
+pub mod wallet_data;
 
 use education::provide_progress;
 use routes::Route;

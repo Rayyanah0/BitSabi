@@ -5,6 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod wallet;
+
+pub use wallet::*;
+
 /// Product name used throughout the interface.
 pub const PRODUCT_NAME: &str = "BitSabi";
 

@@ -5,9 +5,9 @@
 BitSabi is a beginner-friendly Bitcoin learning app for Nigerian users. It is
 being built in small, tested milestones.
 
-**Current status:** Milestones 0–3 — project setup, Axum API skeleton, responsive
-navigation, Home dashboard, five lessons, quizzes, and device-local learning
-progress. Wallet features and NGN payment quotes are not implemented yet.
+**Current status:** Milestones 0–4 plus the testnet wallet creation/import and
+receiving-address foundation. Sending, wallet persistence, and NGN payment quotes
+are not implemented yet.
 
 ## What works today
 
@@ -18,17 +18,22 @@ progress. Wallet features and NGN payment quotes are not implemented yet.
 - Desktop sidebar navigation and mobile bottom navigation.
 - Home dashboard with real progress and a clear next lesson.
 - Five lessons with reading views, one quiz per lesson, and device-local progress.
-- Clear notices that wallet features and payments are not complete.
+- Testnet wallet creation with 12 secure recovery words and BIP84 address derivation.
+- Testnet wallet import with local 12/24-word BIP39 validation.
+- A receiving-address dashboard with clipboard copy and explicit testnet warnings.
+- Clear labels that wallet practice is testnet-only and naira payments are simulated.
 - Security headers and a restrictive CORS origin for local development.
 
 ## What is not implemented
 
 - Server-side progress sync; lesson progress is stored in this browser only.
-- Wallet creation, recovery, addresses, QR codes, sending, or history.
+- Persistent wallets, wallet balances, QR codes, sending, transaction history, or fees.
 - Real or mock BTC/NGN quotes.
 - Authentication, PostgreSQL, and payment-provider integration.
 
-Nothing in this version handles real money. Wallet features will be testnet-only.
+Nothing in this version handles real money. Wallet features are testnet-only.
+Wallet phrases are never persisted or sent to the API; refreshing the page clears
+the receiving address.
 
 ## Technology
 
@@ -36,9 +41,9 @@ Nothing in this version handles real money. Wallet features will be testnet-only
 |---|---|
 | API | Rust, Axum 0.8 |
 | Web | Rust, Dioxus 0.7 WebAssembly |
-| Database | PostgreSQL, introduced in Milestone 4 |
-| Bitcoin | BDK and the Rust Bitcoin ecosystem, introduced in Milestone 6 |
-| Testing | Rust unit/integration tests, browser tests later |
+| Database | PostgreSQL, planned for a later persistence milestone |
+| Bitcoin | Rust Bitcoin and BIP39 for testnet address derivation; BDK not integrated yet |
+| Testing | Rust unit tests; manual browser checks during UI milestones |
 
 ## Prerequisites
 
@@ -48,7 +53,7 @@ Nothing in this version handles real money. Wallet features will be testnet-only
   `cargo install dioxus-cli --version 0.7.10 --locked`
   On Ubuntu without `pkg-config`/OpenSSL development packages, use the prebuilt
   `dx-x86_64-unknown-linux-gnu.tar.gz` binary from the Dioxus GitHub release.
-- PostgreSQL 16 when Milestone 4 begins
+- PostgreSQL 16 when persistence work begins
 
 ## Local setup
 
@@ -85,11 +90,12 @@ Open the URL printed by the Dioxus CLI, usually `http://localhost:8080`.
 ```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
+cargo fmt --all -- --check
 ```
 
-Browser checks are run manually during UI milestones. Automated end-to-end tests
-will be added with the wallet milestones.
+Wallet tests cover secure generation failure, 12/24-word imports, BIP39 checksum
+errors, deterministic derivation, and testnet address formatting. Browser checks
+are run manually during UI milestones; automated end-to-end tests are not set up yet.
 
 ## Project structure
 
@@ -100,8 +106,8 @@ crates/web/      Dioxus WebAssembly application
 docs/            Architecture and security notes
 ```
 
-The wallet will live entirely in the browser. The API may relay public Bitcoin
-testnet data, but it must never receive a recovery phrase or private key. See
+The wallet runs entirely in the browser. The API may later relay public Bitcoin
+testnet data, but it must never receive a recovery phrase, seed, or private key. See
 [`docs/security.md`](docs/security.md).
 
 ## Roadmap
@@ -109,9 +115,9 @@ testnet data, but it must never receive a recovery phrase or private key. See
 1. ~~Project setup and responsive shell~~
 2. ~~Home dashboard and navigation polish~~
 3. ~~Five lessons and quizzes~~
-4. ~~Device-local lesson progress and Settings~~ (current)
+4. ~~Device-local lesson progress and Settings~~
 5. Clearly labelled mock NGN quotes
-6. Testnet wallet creation, import, and receiving
+6. ~~Testnet wallet creation, import, and receiving~~ (current)
 7. Testnet sending, fees, history, and error handling
 8. Automated tests, security review, documentation, deployment preparation
 

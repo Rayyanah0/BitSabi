@@ -49,7 +49,7 @@ pub fn Home() -> Element {
                         ActionLink {
                             to: Route::Wallet {},
                             variant: ButtonVariant::Secondary,
-                            "See the wallet plan"
+                            "Open testnet wallet"
                         }
                     }
                 }
@@ -88,7 +88,7 @@ pub fn Home() -> Element {
             section { class: "section", aria_labelledby: "quick-actions-heading",
                 div { class: "section__heading",
                     h2 { id: "quick-actions-heading", "What do you want to do?" }
-                    p { "Choose a starting point. Wallet and payment features are clearly marked while they are being built." }
+                    p { "Choose a starting point. Wallet practice uses testnet bitcoin, and naira payments are simulated." }
                 }
 
                 div { class: "quick-grid",
@@ -107,7 +107,7 @@ pub fn Home() -> Element {
                         div { class: "quick-card__copy",
                             span { class: "quick-card__badge", "Testnet only" }
                             h3 { "Receive Bitcoin" }
-                            p { "See how a receiving address will work in the testnet wallet." }
+                            p { "Create or import a testnet wallet and copy its receiving address." }
                         }
                         ArrowRightIcon {}
                     }
@@ -115,9 +115,9 @@ pub fn Home() -> Element {
                     Link { class: "quick-card", to: Route::Wallet {},
                         div { class: "quick-card__icon", SendReceiveIcon {} }
                         div { class: "quick-card__copy",
-                            span { class: "quick-card__badge", "Testnet only" }
+                            span { class: "quick-card__badge", "Coming later" }
                             h3 { "Send Bitcoin" }
-                            p { "Review the safety checks before sending bitcoin in practice mode." }
+                            p { "Sending is not part of this testnet milestone yet. Keep your wallet ready for when it arrives." }
                         }
                         ArrowRightIcon {}
                     }
@@ -139,7 +139,7 @@ pub fn Home() -> Element {
                 div {
                     h2 { "No real money. No fake balances." }
                     p {
-                        "BitSabi will use testnet bitcoin for wallet practice and simulated results for NGN quotes. We will never show a balance or payment as real when it is not."
+                        "BitSabi uses testnet bitcoin for wallet practice and simulated results for NGN quotes. We will never show a balance or payment as real when it is not."
                     }
                 }
                 div { class: "safety-note__points",
