@@ -4,10 +4,7 @@
 //! transactions. Wallet recovery phrases, seeds, and private keys never reach
 //! this API.
 
-use std::{
-    collections::HashSet,
-    str::FromStr,
-};
+use std::{collections::HashSet, str::FromStr};
 
 use axum::{
     extract::{DefaultBodyLimit, State},
@@ -60,8 +57,7 @@ async fn broadcast_transaction(
     State(chain): State<ChainClient>,
     Json(request): Json<BroadcastTransactionRequest>,
 ) -> Result<Json<BroadcastTransactionResponse>, ApiError> {
-    let (raw_transaction, expected_txid) =
-        validate_raw_transaction(&request.raw_transaction_hex)?;
+    let (raw_transaction, expected_txid) = validate_raw_transaction(&request.raw_transaction_hex)?;
     let provider_txid = chain
         .broadcast(&raw_transaction)
         .await
@@ -95,7 +91,9 @@ fn validate_addresses(raw_addresses: &[String]) -> Result<Vec<String>, ApiError>
 
     for raw_address in raw_addresses {
         let address = Address::from_str(raw_address.trim()).map_err(|_| {
-            ApiError::InvalidRequest("Every wallet address must be valid.".to_owned())
+            ApiError::InvalidRequest(
+                "Every wallet address must be a valid Bitcoin testnet address.".to_owned(),
+            )
         })?;
         let address = address.require_network(Network::Testnet).map_err(|_| {
             ApiError::InvalidRequest("Only Bitcoin testnet addresses are supported.".to_owned())
@@ -128,7 +126,7 @@ fn validate_raw_transaction(raw_hex: &str) -> Result<(String, Txid), ApiError> {
             "The signed transaction is too large.".to_owned(),
         ));
     }
-    if !raw_hex.len().is_multiple_of(2) {
+    if raw_hex.len() & 1 == 1 {
         return Err(ApiError::InvalidRequest(
             "The signed transaction is not valid hex.".to_owned(),
         ));
@@ -209,6 +207,7 @@ async fn not_found() -> impl IntoResponse {
 mod tests {
     use axum::{
         body::Body,
+        extract::Path,
         http::{Request, StatusCode},
     };
     use bitcoin::{
@@ -250,11 +249,9 @@ mod tests {
 
     #[test]
     fn addresses_must_be_testnet_and_are_deduplicated() {
-        let addresses = validate_addresses(&[
-            TESTNET_ADDRESS.to_owned(),
-            format!(" {TESTNET_ADDRESS} "),
-        ])
-        .unwrap();
+        let addresses =
+            validate_addresses(&[TESTNET_ADDRESS.to_owned(), format!(" {TESTNET_ADDRESS} ")])
+                .unwrap();
 
         assert_eq!(addresses, vec![TESTNET_ADDRESS.to_owned()]);
     }
@@ -269,7 +266,10 @@ mod tests {
     #[test]
     fn raw_transaction_validation_returns_the_computed_txid() {
         let transaction = unsigned_transaction();
-        let raw_hex = serialize(&transaction).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let raw_hex = serialize(&transaction)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
 
         let (validated_hex, txid) = validate_raw_transaction(&raw_hex).unwrap();
 
@@ -284,7 +284,10 @@ mod tests {
 
         let mut transaction = unsigned_transaction();
         transaction.output.clear();
-        let raw_hex = serialize(&transaction).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let raw_hex = serialize(&transaction)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         assert!(validate_raw_transaction(&raw_hex).is_err());
     }
 
@@ -361,12 +364,15 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let snapshot: WalletSnapshot = serde_json::from_slice(&body).unwrap();
         assert_eq!(snapshot.tip_height, 850_000);
-        assert_eq!(snapshot.fees.fastest_sat_vb, 2);
+        assert_eq!(snapshot.fees.unwrap().fastest_sat_vb, 2);
         assert_eq!(snapshot.addresses.len(), 1);
         assert_eq!(snapshot.addresses[0].utxos[0].value, 40_000);
         assert_eq!(snapshot.addresses[0].transactions[0].net_value, 40_000);
 
-        let raw_hex = serialize(&transaction).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let raw_hex = serialize(&transaction)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         let broadcast_body = serde_json::json!({ "raw_transaction_hex": raw_hex });
         let response = app
             .oneshot(
@@ -419,7 +425,7 @@ mod tests {
             }]))
         }
 
-        async fn transactions(State(address): State<String>) -> Json<serde_json::Value> {
+        async fn transactions(Path(address): Path<String>) -> Json<serde_json::Value> {
             Json(serde_json::json!([{
                 "txid": "2222222222222222222222222222222222222222222222222222222222222222",
                 "fee": 200,
@@ -457,9 +463,7 @@ mod tests {
             .route("/tx", post(broadcast))
             .with_state(txid);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();

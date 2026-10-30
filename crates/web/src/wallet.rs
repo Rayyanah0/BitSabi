@@ -277,8 +277,8 @@ impl WalletSession {
         }
 
         self.visible_receive_count += 1;
-        let required = (self.visible_receive_count as u32 + RECEIVE_GAP_LIMIT)
-            .min(MAX_RECEIVE_ADDRESSES);
+        let required =
+            (self.visible_receive_count as u32 + RECEIVE_GAP_LIMIT).min(MAX_RECEIVE_ADDRESSES);
         while self.receive_addresses.len() < required as usize {
             let index = self.receive_addresses.len() as u32;
             self.extend_receive_address(index)?;
@@ -454,7 +454,9 @@ pub fn parse_btc_amount(input: &str) -> Result<u64, WalletError> {
         return Err(WalletError::InvalidAmount);
     }
 
-    let whole = whole.parse::<u64>().map_err(|_| WalletError::InvalidAmount)?;
+    let whole = whole
+        .parse::<u64>()
+        .map_err(|_| WalletError::InvalidAmount)?;
     let mut sats = whole
         .checked_mul(100_000_000)
         .ok_or(WalletError::InvalidAmount)?;
@@ -462,9 +464,7 @@ pub fn parse_btc_amount(input: &str) -> Result<u64, WalletError> {
     if let Some(fraction) = fraction {
         if fraction.is_empty()
             || fraction.len() > 8
-            || !fraction
-                .chars()
-                .all(|character| character.is_ascii_digit())
+            || !fraction.chars().all(|character| character.is_ascii_digit())
         {
             return Err(WalletError::InvalidAmount);
         }
@@ -511,6 +511,30 @@ pub fn format_signed_sats(sats: i64) -> String {
     }
 }
 
+/// Formats a satoshi amount with thousands separators.
+#[must_use]
+pub fn format_satoshis(sats: u64) -> String {
+    let digits = sats.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(character);
+    }
+    format!("{grouped} sats")
+}
+
+/// Formats a signed satoshi amount with thousands separators.
+#[must_use]
+pub fn format_signed_satoshis(sats: i64) -> String {
+    if sats < 0 {
+        format!("-{}", format_satoshis(sats.unsigned_abs()))
+    } else {
+        format_satoshis(sats as u64)
+    }
+}
+
 /// Validates a recipient and returns its checked testnet address.
 pub fn validate_recipient(recipient: &str) -> Result<Address, WalletError> {
     let address = Address::from_str(recipient.trim()).map_err(|_| WalletError::InvalidRecipient)?;
@@ -547,12 +571,14 @@ pub fn plan_send(
         .iter()
         .filter(|entry| entry.utxo.status.confirmed)
         .filter_map(|entry| {
-            session.owned_address(&entry.address).map(|owned| SendInput {
-                utxo: entry.utxo.clone(),
-                branch: owned.branch,
-                index: owned.index,
-                script_pubkey: owned.script_pubkey.clone(),
-            })
+            session
+                .owned_address(&entry.address)
+                .map(|owned| SendInput {
+                    utxo: entry.utxo.clone(),
+                    branch: owned.branch,
+                    index: owned.index,
+                    script_pubkey: owned.script_pubkey.clone(),
+                })
         })
         .collect::<Vec<_>>();
 
@@ -586,11 +612,7 @@ pub fn plan_send(
         selected.push(candidate);
 
         let fee_with_change = fee_for_size(
-            estimated_vsize(
-                selected.len(),
-                recipient_script.len(),
-                true,
-            ),
+            estimated_vsize(selected.len(), recipient_script.len(), true),
             fee_rate_sat_vb,
         )?;
         let with_change_total = amount_sat
@@ -600,11 +622,7 @@ pub fn plan_send(
         if total_input_sat >= with_change_total {
             let change_sat = total_input_sat - with_change_total;
             if change_sat >= change_dust {
-                let vsize = estimated_vsize(
-                    selected.len(),
-                    recipient_script.len(),
-                    true,
-                );
+                let vsize = estimated_vsize(selected.len(), recipient_script.len(), true);
                 return Ok(SendPlan {
                     recipient: recipient.to_string(),
                     amount_sat,
@@ -620,11 +638,7 @@ pub fn plan_send(
             }
 
             let fee_without_change = fee_for_size(
-                estimated_vsize(
-                    selected.len(),
-                    recipient_script.len(),
-                    false,
-                ),
+                estimated_vsize(selected.len(), recipient_script.len(), false),
                 fee_rate_sat_vb,
             )?;
             let without_change_total = amount_sat
@@ -638,11 +652,7 @@ pub fn plan_send(
                     fee_rate_sat_vb,
                     change_sat: 0,
                     change_address: None,
-                    vsize: estimated_vsize(
-                        selected.len(),
-                        recipient_script.len(),
-                        false,
-                    ),
+                    vsize: estimated_vsize(selected.len(), recipient_script.len(), false),
                     total_input_sat,
                     input_count: selected.len(),
                     inputs: selected,
@@ -662,10 +672,7 @@ pub fn sign_send_plan(
     session: &WalletSession,
     plan: &SendPlan,
 ) -> Result<SignedTransaction, WalletError> {
-    if plan.inputs.is_empty()
-        || plan.amount_sat == 0
-        || plan.input_count != plan.inputs.len()
-    {
+    if plan.inputs.is_empty() || plan.amount_sat == 0 || plan.input_count != plan.inputs.len() {
         return Err(WalletError::TransactionFailed);
     }
 
@@ -688,7 +695,9 @@ pub fn sign_send_plan(
 
     let total_output = outputs
         .iter()
-        .try_fold(0_u64, |total, output| total.checked_add(output.value.to_sat()))
+        .try_fold(0_u64, |total, output| {
+            total.checked_add(output.value.to_sat())
+        })
         .ok_or(WalletError::TransactionFailed)?;
     let expected_fee = plan
         .total_input_sat
@@ -734,8 +743,7 @@ pub fn sign_send_plan(
                 .map_err(|_| WalletError::KeyDerivationFailed)?;
             let public_key = child.private_key.public_key(&secp);
             let expected_script =
-                Address::p2wpkh(&CompressedPublicKey(public_key), Network::Testnet)
-                    .script_pubkey();
+                Address::p2wpkh(&CompressedPublicKey(public_key), Network::Testnet).script_pubkey();
             if expected_script != input.script_pubkey {
                 return Err(WalletError::TransactionFailed);
             }
@@ -780,10 +788,7 @@ pub fn sign_send_plan(
     })
 }
 
-fn derivation_path(
-    branch: AddressBranch,
-    index: u32,
-) -> Result<DerivationPath, WalletError> {
+fn derivation_path(branch: AddressBranch, index: u32) -> Result<DerivationPath, WalletError> {
     let path = format!("m/84'/1'/0'/{}/{}", branch.index(), index);
     DerivationPath::from_str(&path).map_err(|_| WalletError::KeyDerivationFailed)
 }
@@ -866,7 +871,7 @@ fn estimated_vsize(input_count: usize, recipient_script_len: usize, include_chan
         + 4;
     let witness_size = WITNESS_MARKER_BYTES + input_count * P2WPKH_WITNESS_BYTES;
     let weight = base_size * 4 + witness_size;
-    (weight + 3) / 4
+    weight.div_ceil(4)
 }
 
 fn varint_size(value: u64) -> u64 {
@@ -1085,18 +1090,20 @@ mod tests {
     }
 
     #[test]
+    fn satoshi_unit_formatting_groups_digits() {
+        assert_eq!(format_satoshis(0), "0 sats");
+        assert_eq!(format_satoshis(999), "999 sats");
+        assert_eq!(format_satoshis(1_000), "1,000 sats");
+        assert_eq!(format_satoshis(1_234_567), "1,234,567 sats");
+        assert_eq!(format_signed_satoshis(-50_000), "-50,000 sats");
+    }
+
+    #[test]
     fn send_plan_selects_confirmed_utxos_and_returns_change() {
         let session = test_session();
         let utxos = vec![test_utxo(TEST_PHRASE_12_ADDRESS, 100_000)];
 
-        let plan = plan_send(
-            &session,
-            &utxos,
-            TEST_PHRASE_12_ADDRESS,
-            50_000,
-            2,
-        )
-        .unwrap();
+        let plan = plan_send(&session, &utxos, TEST_PHRASE_12_ADDRESS, 50_000, 2).unwrap();
 
         assert_eq!(plan.input_count, 1);
         assert_eq!(plan.amount_sat, 50_000);

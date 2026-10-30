@@ -5,9 +5,9 @@
 BitSabi is a beginner-friendly Bitcoin learning app for Nigerian users. It is
 being built in small, tested milestones.
 
-**Current status:** Milestones 0–4 plus the testnet wallet creation/import and
-receiving-address foundation. Sending, wallet persistence, and NGN payment quotes
-are not implemented yet.
+**Current status:** Milestones 0–4 plus the testnet wallet creation/import,
+receiving-address, balance, transaction-history, and fee-estimation foundation.
+Wallet persistence and NGN payment quotes are not implemented yet.
 
 ## What works today
 
@@ -20,20 +20,24 @@ are not implemented yet.
 - Five lessons with reading views, one quiz per lesson, and device-local progress.
 - Testnet wallet creation with 12 secure recovery words and BIP84 address derivation.
 - Testnet wallet import with local 12/24-word BIP39 validation.
-- A receiving-address dashboard with clipboard copy and explicit testnet warnings.
+- A receiving-address dashboard with QR code, clipboard copy, and testnet warnings.
+- Live testnet balances in BTC and sats: confirmed, unconfirmed, and total.
+- Transaction history with direction, confirmations, dates, and explorer links.
+- Testnet fee estimates, manual refresh, and 60-second automatic refresh.
+- An existing testnet send flow signs locally and broadcasts only the signed transaction.
 - Clear labels that wallet practice is testnet-only and naira payments are simulated.
 - Security headers and a restrictive CORS origin for local development.
 
 ## What is not implemented
 
 - Server-side progress sync; lesson progress is stored in this browser only.
-- Persistent wallets, wallet balances, QR codes, sending, transaction history, or fees.
+- Persistent wallets, wallet balances cached across refreshes, or authentication.
 - Real or mock BTC/NGN quotes.
-- Authentication, PostgreSQL, and payment-provider integration.
+- PostgreSQL and payment-provider integration.
 
 Nothing in this version handles real money. Wallet features are testnet-only.
 Wallet phrases are never persisted or sent to the API; refreshing the page clears
-the receiving address.
+the wallet session and its addressing keys.
 
 ## Technology
 
@@ -42,7 +46,7 @@ the receiving address.
 | API | Rust, Axum 0.8 |
 | Web | Rust, Dioxus 0.7 WebAssembly |
 | Database | PostgreSQL, planned for a later persistence milestone |
-| Bitcoin | Rust Bitcoin and BIP39 for testnet address derivation; BDK not integrated yet |
+| Bitcoin | Rust Bitcoin and BIP39 for testnet address derivation; Blockstream Esplora testnet API for chain data |
 | Testing | Rust unit tests; manual browser checks during UI milestones |
 
 ## Prerequisites
@@ -94,8 +98,10 @@ cargo fmt --all -- --check
 ```
 
 Wallet tests cover secure generation failure, 12/24-word imports, BIP39 checksum
-errors, deterministic derivation, and testnet address formatting. Browser checks
-are run manually during UI milestones; automated end-to-end tests are not set up yet.
+errors, deterministic derivation, testnet address formatting, balance
+aggregation, transaction direction and confirmations, fee parsing, chain-provider
+failures, and malformed API responses. Browser checks are run manually during UI
+milestones; automated end-to-end tests are not set up yet.
 
 ## Project structure
 
@@ -117,9 +123,9 @@ testnet data, but it must never receive a recovery phrase, seed, or private key.
 3. ~~Five lessons and quizzes~~
 4. ~~Device-local lesson progress and Settings~~
 5. Clearly labelled mock NGN quotes
-6. ~~Testnet wallet creation, import, and receiving~~ (current)
-7. Testnet sending, fees, history, and error handling
-8. Automated tests, security review, documentation, deployment preparation
+6. ~~Testnet wallet creation, import, and receiving~~
+7. ~~Testnet balances, history, fee estimates, and existing send flow~~ (current)
+8. Wallet persistence, automated end-to-end tests, security review, deployment preparation
 
 Mainnet and real NGN payments are explicitly out of scope until the wallet has
 been reviewed and a licensed payment provider has been selected.

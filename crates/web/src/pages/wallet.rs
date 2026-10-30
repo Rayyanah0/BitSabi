@@ -8,19 +8,21 @@ use bitsabi_shared::{FeeEstimates, WalletSnapshot};
 use crate::{
     api,
     components::{
-        AddressQrCode, ArrowLeftIcon, CheckIcon, ClockIcon, CopyIcon, ExternalLinkIcon,
-        ImportIcon, PrimaryButton, RefreshIcon, SecondaryButton, SendReceiveIcon, ShieldIcon,
-        WalletIcon, WarningIcon,
+        AddressQrCode, ArrowLeftIcon, CheckIcon, ClockIcon, CopyIcon, ExternalLinkIcon, ImportIcon,
+        PrimaryButton, RefreshIcon, SecondaryButton, SendReceiveIcon, ShieldIcon, WalletIcon,
+        WarningIcon,
     },
     wallet::{
-        format_sats, format_signed_sats, parse_btc_amount, plan_send, sign_send_plan,
-        SendPlan, SignedTransaction, WalletSession,
+        format_satoshis, format_sats, format_signed_satoshis, format_signed_sats, parse_btc_amount,
+        plan_send, sign_send_plan, SendPlan, SignedTransaction, WalletSession,
     },
-    wallet_data::{HistoryTransaction, TransactionDirection, WalletSummary},
+    wallet_data::{format_block_time, HistoryTransaction, TransactionDirection, WalletSummary},
 };
 
 const HISTORY_PAGE_SIZE: usize = 8;
 const OVERVIEW_TX_LIMIT: usize = 3;
+#[cfg(target_arch = "wasm32")]
+const AUTO_REFRESH_INTERVAL_MS: u32 = 60_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WalletStage {
@@ -86,7 +88,7 @@ pub fn Wallet() -> Element {
     let mut snapshot = use_signal(|| None::<WalletSnapshot>);
     let mut summary = use_signal(|| None::<WalletSummary>);
     let mut loading = use_signal(|| false);
-    let mut refresh_error = use_signal(|| None::<String>);
+    let mut refresh_error = use_signal(|| None::<api::ApiError>);
     let mut refresh_id = use_signal(|| 0_u64);
     let mut send_address = use_signal(String::new);
     let mut send_amount = use_signal(String::new);
@@ -129,38 +131,40 @@ pub fn Wallet() -> Element {
         stage.set(WalletStage::Landing);
     });
 
-    let begin_wallet = use_callback(move |(new_session, new_source): (WalletSession, WalletSource)| {
-        let addresses = new_session.scan_addresses();
-        session.set(Some(new_session));
-        source.set(Some(new_source));
-        wallet_error.set(None);
-        copy_state.set(CopyState::Idle);
-        copied_address.set(None);
-        panel.set(WalletPanel::Overview);
-        snapshot.set(None);
-        summary.set(None);
-        refresh_error.set(None);
-        send_address.set(String::new());
-        send_amount.set(String::new());
-        fee_choice.set(FeeChoice::Normal);
-        custom_fee_rate.set(String::new());
-        send_error.set(None);
-        send_plan.set(None);
-        send_signed.set(None);
-        broadcast_state.set(BroadcastState::Idle);
-        sending.set(false);
-        visible_tx_count.set(HISTORY_PAGE_SIZE);
-        stage.set(WalletStage::Ready);
-        request_wallet_refresh(
-            addresses,
-            true,
-            snapshot,
-            summary,
-            loading,
-            refresh_error,
-            refresh_id,
-        );
-    });
+    let begin_wallet = use_callback(
+        move |(new_session, new_source): (WalletSession, WalletSource)| {
+            let addresses = new_session.scan_addresses();
+            session.set(Some(new_session));
+            source.set(Some(new_source));
+            wallet_error.set(None);
+            copy_state.set(CopyState::Idle);
+            copied_address.set(None);
+            panel.set(WalletPanel::Overview);
+            snapshot.set(None);
+            summary.set(None);
+            refresh_error.set(None);
+            send_address.set(String::new());
+            send_amount.set(String::new());
+            fee_choice.set(FeeChoice::Normal);
+            custom_fee_rate.set(String::new());
+            send_error.set(None);
+            send_plan.set(None);
+            send_signed.set(None);
+            broadcast_state.set(BroadcastState::Idle);
+            sending.set(false);
+            visible_tx_count.set(HISTORY_PAGE_SIZE);
+            stage.set(WalletStage::Ready);
+            request_wallet_refresh(
+                addresses,
+                true,
+                snapshot,
+                summary,
+                loading,
+                refresh_error,
+                refresh_id,
+            );
+        },
+    );
 
     let start_create = use_callback(move |()| {
         reset_to_landing.call(());
@@ -189,8 +193,7 @@ pub fn Wallet() -> Element {
             if phrase.trim().is_empty() {
                 Err("Enter a 12- or 24-word recovery phrase.".to_owned())
             } else {
-                WalletSession::from_phrase(phrase.as_str())
-                    .map_err(|error| error.to_string())
+                WalletSession::from_phrase(phrase.as_str()).map_err(|error| error.to_string())
             }
         };
 
@@ -248,6 +251,34 @@ pub fn Wallet() -> Element {
         );
     });
 
+    use_future(move || async move {
+        loop {
+            wait_for_auto_refresh().await;
+            if stage() != WalletStage::Ready || sending() {
+                continue;
+            }
+
+            let addresses = session
+                .read()
+                .as_ref()
+                .map(WalletSession::scan_addresses)
+                .unwrap_or_default();
+            if addresses.is_empty() {
+                continue;
+            }
+
+            request_wallet_refresh(
+                addresses,
+                false,
+                snapshot,
+                summary,
+                loading,
+                refresh_error,
+                refresh_id,
+            );
+        }
+    });
+
     let generate_address = use_callback(move |()| {
         let result = {
             let mut wallet = session.write();
@@ -291,7 +322,7 @@ pub fn Wallet() -> Element {
         let amount_text = send_amount.read().trim().to_owned();
         let fee_choice_value = fee_choice();
         let custom_fee = custom_fee_rate.read().trim().to_owned();
-        let Some(fees) = snapshot.read().as_ref().map(|snapshot| snapshot.fees) else {
+        let Some(fees) = snapshot.read().as_ref().and_then(|snapshot| snapshot.fees) else {
             send_error.set(Some(
                 "Load the wallet balance and fee estimates before sending.".to_owned(),
             ));
@@ -321,10 +352,8 @@ pub fn Wallet() -> Element {
         let result = {
             let wallet = session.read();
             match wallet.as_ref() {
-                Some(wallet) => {
-                    plan_send(wallet, &spendable, &recipient, amount_sat, fee_rate)
-                        .map_err(|error| error.to_string())
-                }
+                Some(wallet) => plan_send(wallet, &spendable, &recipient, amount_sat, fee_rate)
+                    .map_err(|error| error.to_string()),
                 None => Err("The wallet session is not available. Start over.".to_owned()),
             }
         };
@@ -694,7 +723,13 @@ pub fn Wallet() -> Element {
                 .map(|(_, address)| address.clone())
                 .unwrap_or_default();
             let wallet_summary = summary.read().clone();
-            let snapshot_fees = snapshot.read().as_ref().map(|snapshot| snapshot.fees);
+            let (snapshot_fees, last_updated) = {
+                let snapshot = snapshot.read();
+                (
+                    snapshot.as_ref().and_then(|snapshot| snapshot.fees),
+                    snapshot.as_ref().map(|snapshot| snapshot.fetched_at),
+                )
+            };
             let active_panel = panel();
             let broadcast = broadcast_state();
             let plan = send_plan.read().clone();
@@ -720,13 +755,20 @@ pub fn Wallet() -> Element {
                 div { class: "wallet-toolbar",
                     div { class: "wallet-toolbar__meta",
                         span { class: "wallet-toolbar__dot" }
-                        span {
-                            if loading() {
-                                "Refreshing testnet data..."
-                            } else if let Some(summary) = wallet_summary.as_ref() {
-                                "Chain tip #{summary.tip_height} · {summary.provider}"
-                            } else {
-                                "Waiting for testnet data"
+                        div {
+                            span {
+                                if loading() {
+                                    "Refreshing testnet data..."
+                                } else if let Some(summary) = wallet_summary.as_ref() {
+                                    "Chain tip #{summary.tip_height} · {summary.provider}"
+                                } else {
+                                    "Waiting for testnet data"
+                                }
+                            }
+                            if let Some(updated) = last_updated {
+                                span { class: "wallet-toolbar__updated",
+                                    "Updated {format_block_time(updated)} · Auto-refresh every 60s"
+                                }
                             }
                         }
                     }
@@ -781,18 +823,22 @@ pub fn Wallet() -> Element {
                     }
                 }
 
-                if let Some(message) = refresh_error.read().as_ref() {
+                if let Some(error) = refresh_error.read().as_ref() {
                     div { class: "wallet-alert wallet-alert--warning", role: "status",
                         WarningIcon {}
                         div {
                             strong {
-                                if wallet_summary.is_some() {
+                                if api::browser_is_offline() {
+                                    "You are offline"
+                                } else if error.kind() == api::ApiErrorKind::Network {
+                                    "Cannot reach the testnet service"
+                                } else if wallet_summary.is_some() {
                                     "Showing the last wallet snapshot"
                                 } else {
                                     "Wallet data is unavailable"
                                 }
                             }
-                            p { "{message}" }
+                            p { "{error.message()}" }
                             button {
                                 class: "text-button",
                                 r#type: "button",
@@ -809,10 +855,11 @@ pub fn Wallet() -> Element {
                             article { class: "wallet-balance-card wallet-balance-card--primary",
                                 span { class: "wallet-balance-card__label", "Confirmed balance" }
                                 strong { class: "wallet-balance-card__value", {format_signed_sats(summary.confirmed_sat)} }
+                                span { class: "wallet-balance-card__sats", {format_signed_satoshis(summary.confirmed_sat)} }
                                 p { "Available to spend now" }
                             }
                             article { class: "wallet-balance-card",
-                                span { class: "wallet-balance-card__label", "Pending" }
+                                span { class: "wallet-balance-card__label", "Unconfirmed balance" }
                                 strong {
                                     class: if summary.pending_sat < 0 {
                                         "wallet-balance-card__value wallet-balance-card__value--negative"
@@ -821,6 +868,7 @@ pub fn Wallet() -> Element {
                                     },
                                     {format_signed_sats(summary.pending_sat)}
                                 }
+                                span { class: "wallet-balance-card__sats", {format_signed_satoshis(summary.pending_sat)} }
                                 p {
                                     if summary.pending_sat == 0 {
                                         "No unconfirmed changes"
@@ -830,9 +878,15 @@ pub fn Wallet() -> Element {
                                 }
                             }
                             article { class: "wallet-balance-card",
-                                span { class: "wallet-balance-card__label", "Total" }
+                                span { class: "wallet-balance-card__label", "Total balance" }
                                 strong { class: "wallet-balance-card__value", {format_signed_sats(summary.total_sat)} }
+                                span { class: "wallet-balance-card__sats", {format_signed_satoshis(summary.total_sat)} }
                                 p { "{summary.utxos.len()} outputs · {summary.transactions.len()} transactions" }
+                            }
+                        }
+                        if summary.total_sat == 0 && summary.transactions.is_empty() {
+                            p { class: "wallet-balance-empty",
+                                "This wallet has no testnet bitcoin yet. Share a receiving address to get started."
                             }
                         }
                     } else if loading() {
@@ -852,6 +906,44 @@ pub fn Wallet() -> Element {
                                 onclick: move |_| manual_refresh.call(()),
                                 RefreshIcon {}
                                 "Refresh"
+                            }
+                        }
+                    }
+
+                    if wallet_summary.is_some() {
+                        section { class: "wallet-panel wallet-fees-panel",
+                            div { class: "wallet-panel__header",
+                                div {
+                                    h2 { "Testnet network fees" }
+                                    p {
+                                        "Estimated fee rates from the testnet provider. A transaction's actual fee depends on its size in virtual bytes."
+                                    }
+                                }
+                                span { class: "pill", "sat/vB" }
+                            }
+                            if let Some(fees) = snapshot_fees {
+                                div { class: "wallet-fee-grid",
+                                    for (label, target, rate) in fee_estimate_rows(fees) {
+                                        div { key: "{label}", class: "wallet-fee-card",
+                                            span { class: "wallet-fee-card__label", "{label}" }
+                                            strong { class: "wallet-fee-card__rate", "{rate}" }
+                                            span { class: "wallet-fee-card__target", "{target}" }
+                                        }
+                                    }
+                                }
+                                p { class: "wallet-field__help",
+                                    "Fees are paid to testnet miners and are not charged by BitSabi. Estimates can change before a transaction confirms."
+                                }
+                            } else {
+                                div { class: "wallet-alert wallet-alert--warning", role: "status",
+                                    WarningIcon {}
+                                    div {
+                                        strong { "Fee estimates are unavailable" }
+                                        p {
+                                            "Your balance and history are still current. Refresh to try loading fee estimates again."
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1102,8 +1194,20 @@ pub fn Wallet() -> Element {
                         if snapshot_fees.is_none() {
                             div { class: "wallet-empty",
                                 RefreshIcon {}
-                                h3 { "Wallet data is still loading" }
-                                p { "Balance and fee estimates are needed before a transaction can be prepared." }
+                                h3 {
+                                    if wallet_summary.is_some() {
+                                        "Fee estimates are unavailable"
+                                    } else {
+                                        "Wallet data is still loading"
+                                    }
+                                }
+                                p {
+                                    if wallet_summary.is_some() {
+                                        "Your balance is available, but sending needs a current fee estimate. Refresh to try again."
+                                    } else {
+                                        "Balance and fee estimates are needed before a transaction can be prepared."
+                                    }
+                                }
                                 SecondaryButton {
                                     onclick: move |_| manual_refresh.call(()),
                                     RefreshIcon {}
@@ -1475,6 +1579,15 @@ fn TransactionRow(transaction: HistoryTransaction) -> Element {
         }
         TransactionDirection::SelfTransfer => "0 BTC".to_owned(),
     };
+    let amount_sats = match direction {
+        TransactionDirection::Received => {
+            format!("+{}", format_satoshis(transaction.net_value.unsigned_abs()))
+        }
+        TransactionDirection::Sent => {
+            format!("-{}", format_satoshis(transaction.net_value.unsigned_abs()))
+        }
+        TransactionDirection::SelfTransfer => "0 sats".to_owned(),
+    };
     let status = if transaction.status.confirmed {
         match transaction.confirmations {
             1 => "1 confirmation".to_owned(),
@@ -1483,11 +1596,9 @@ fn TransactionRow(transaction: HistoryTransaction) -> Element {
     } else {
         "Pending".to_owned()
     };
+    let block_time = transaction.status.block_time.map(format_block_time);
     let short_txid = short_txid(&transaction.txid);
-    let explorer_url = format!(
-        "https://mempool.space/testnet/tx/{}",
-        transaction.txid
-    );
+    let explorer_url = format!("https://mempool.space/testnet/tx/{}", transaction.txid);
 
     rsx! {
         article { class: "wallet-tx {direction_class}",
@@ -1504,9 +1615,15 @@ fn TransactionRow(transaction: HistoryTransaction) -> Element {
                         strong { "{direction_label}" }
                         span { class: "wallet-tx__status", "{status}" }
                     }
-                    strong { class: "wallet-tx__amount", "{amount}" }
+                    div { class: "wallet-tx__amounts",
+                        strong { class: "wallet-tx__amount", "{amount}" }
+                        span { class: "wallet-tx__amount-sats", "{amount_sats}" }
+                    }
                 }
                 div { class: "wallet-tx__meta",
+                    if let Some(block_time) = block_time.as_deref() {
+                        span { "{block_time}" }
+                    }
                     if transaction.status.confirmed {
                         if let Some(height) = transaction.status.block_height {
                             span { "Block #{height}" }
@@ -1519,7 +1636,7 @@ fn TransactionRow(transaction: HistoryTransaction) -> Element {
                         TransactionDirection::Sent | TransactionDirection::SelfTransfer
                     ) {
                         if let Some(fee) = transaction.fee {
-                            span { "Fee {format_sats(fee)}" }
+                            span { "Fee {format_sats(fee)} ({format_satoshis(fee)})" }
                         }
                     }
                     a {
@@ -1527,14 +1644,26 @@ fn TransactionRow(transaction: HistoryTransaction) -> Element {
                         href: "{explorer_url}",
                         target: "_blank",
                         rel: "noopener noreferrer",
-                        title: "View transaction on mempool.space",
+                        title: "View transaction {transaction.txid} on mempool.space",
+                        aria_label: "View transaction {transaction.txid} on mempool.space",
                         "{short_txid}"
                         ExternalLinkIcon {}
                     }
+                    code { class: "wallet-tx__txid", "{transaction.txid}" }
                 }
             }
         }
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn wait_for_auto_refresh() {
+    gloo_timers::future::TimeoutFuture::new(AUTO_REFRESH_INTERVAL_MS).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn wait_for_auto_refresh() {
+    std::future::pending::<()>().await;
 }
 
 fn tab_class(active: bool) -> &'static str {
@@ -1545,6 +1674,16 @@ fn tab_class(active: bool) -> &'static str {
     }
 }
 
+fn fee_estimate_rows(fees: FeeEstimates) -> [(&'static str, &'static str, u64); 5] {
+    [
+        ("Fastest", "Next block", fees.fastest_sat_vb),
+        ("Normal", "Around 30 minutes", fees.half_hour_sat_vb),
+        ("Planned", "Around 1 hour", fees.hour_sat_vb),
+        ("Economy", "Around 1 day", fees.economy_sat_vb),
+        ("Minimum", "Around 1 week", fees.minimum_sat_vb),
+    ]
+}
+
 fn fee_options(fees: FeeEstimates) -> [(FeeChoice, &'static str, u64); 3] {
     [
         (FeeChoice::Fastest, "Fastest", fees.fastest_sat_vb),
@@ -1553,11 +1692,7 @@ fn fee_options(fees: FeeEstimates) -> [(FeeChoice, &'static str, u64); 3] {
     ]
 }
 
-fn fee_rate_for_choice(
-    choice: FeeChoice,
-    custom: &str,
-    fees: FeeEstimates,
-) -> Result<u64, String> {
+fn fee_rate_for_choice(choice: FeeChoice, custom: &str, fees: FeeEstimates) -> Result<u64, String> {
     let rate = match choice {
         FeeChoice::Fastest => fees.fastest_sat_vb,
         FeeChoice::Normal => fees.half_hour_sat_vb,
@@ -1588,7 +1723,7 @@ fn request_wallet_refresh(
     mut snapshot: Signal<Option<WalletSnapshot>>,
     mut summary: Signal<Option<WalletSummary>>,
     mut loading: Signal<bool>,
-    mut refresh_error: Signal<Option<String>>,
+    mut refresh_error: Signal<Option<api::ApiError>>,
     mut refresh_id: Signal<u64>,
 ) {
     if addresses.is_empty() || (loading() && !force) {
@@ -1613,7 +1748,7 @@ fn request_wallet_refresh(
                 snapshot.set(Some(wallet_snapshot));
                 refresh_error.set(None);
             }
-            Err(error) => refresh_error.set(Some(error.message().to_owned())),
+            Err(error) => refresh_error.set(Some(error)),
         }
         loading.set(false);
     });
@@ -1680,6 +1815,22 @@ mod tests {
     }
 
     #[test]
+    fn fee_rows_include_every_confirmation_target() {
+        let fees = FeeEstimates {
+            fastest_sat_vb: 5,
+            half_hour_sat_vb: 4,
+            hour_sat_vb: 3,
+            economy_sat_vb: 2,
+            minimum_sat_vb: 1,
+        };
+        let rows = fee_estimate_rows(fees);
+
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0], ("Fastest", "Next block", 5));
+        assert_eq!(rows[4], ("Minimum", "Around 1 week", 1));
+    }
+
+    #[test]
     fn fee_choices_map_to_estimates() {
         let fees = FeeEstimates {
             fastest_sat_vb: 5,
@@ -1693,10 +1844,7 @@ mod tests {
             fee_rate_for_choice(FeeChoice::Fastest, "", fees).unwrap(),
             5
         );
-        assert_eq!(
-            fee_rate_for_choice(FeeChoice::Normal, "", fees).unwrap(),
-            3
-        );
+        assert_eq!(fee_rate_for_choice(FeeChoice::Normal, "", fees).unwrap(), 3);
         assert_eq!(
             fee_rate_for_choice(FeeChoice::Economy, "", fees).unwrap(),
             1

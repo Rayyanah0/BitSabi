@@ -108,8 +108,8 @@ pub struct WalletSnapshot {
     pub tip_height: u64,
     /// Snapshot creation time in Unix seconds.
     pub fetched_at: u64,
-    /// Fee recommendations.
-    pub fees: FeeEstimates,
+    /// Fee recommendations when the provider returned usable data.
+    pub fees: Option<FeeEstimates>,
     /// Per-address chain data.
     pub addresses: Vec<AddressSnapshot>,
 }

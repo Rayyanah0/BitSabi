@@ -66,9 +66,8 @@ impl Config {
             .parse::<SocketAddr>()
             .map_err(ConfigError::BindAddress)?;
 
-        let raw_origins = std::env::var("FRONTEND_ORIGIN").unwrap_or_else(|_| {
-            "http://localhost:8080,http://127.0.0.1:8080".to_owned()
-        });
+        let raw_origins = std::env::var("FRONTEND_ORIGIN")
+            .unwrap_or_else(|_| "http://localhost:8080,http://127.0.0.1:8080".to_owned());
         let frontend_origins = parse_origins(&raw_origins)?;
 
         let environment = std::env::var("APP_ENV")
@@ -122,10 +121,12 @@ impl Config {
 
 fn parse_origins(raw: &str) -> Result<Vec<HeaderValue>, ConfigError> {
     let mut origins = Vec::new();
-    for origin in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
-        origins.push(
-            HeaderValue::from_str(origin).map_err(ConfigError::FrontendOrigin)?,
-        );
+    for origin in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        origins.push(HeaderValue::from_str(origin).map_err(ConfigError::FrontendOrigin)?);
     }
 
     if origins.is_empty() {
@@ -184,10 +185,7 @@ mod tests {
 
     #[test]
     fn origins_accept_a_comma_separated_allow_list() {
-        let origins = parse_origins(
-            "http://localhost:8080, http://127.0.0.1:8080,,",
-        )
-        .unwrap();
+        let origins = parse_origins("http://localhost:8080, http://127.0.0.1:8080,,").unwrap();
 
         assert_eq!(origins.len(), 2);
     }

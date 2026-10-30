@@ -56,7 +56,7 @@ impl ChainClient {
     ) -> Result<WalletSnapshot, ChainError> {
         let (tip_height, fees) = tokio::join!(self.tip_height(), self.fee_estimates());
         let tip_height = tip_height?;
-        let fees = fees?;
+        let fees = fees.ok();
 
         let stats = self.address_stats_many(addresses).await?;
         let mut address_results: Vec<Option<AddressSnapshot>> =
@@ -155,28 +155,12 @@ impl ChainClient {
     }
 
     async fn address_stats(&self, address: &str) -> Result<AddressStatsSet, ChainError> {
-        let stats: EsploraAddressStats = self
-            .get_json(&format!("/address/{address}"))
-            .await?;
-
-        Ok(AddressStatsSet {
-            chain_stats: AddressStats {
-                funded_txo_sum: stats.chain_stats.funded_txo_sum,
-                spent_txo_sum: stats.chain_stats.spent_txo_sum,
-                tx_count: stats.chain_stats.tx_count,
-            },
-            mempool_stats: AddressStats {
-                funded_txo_sum: stats.mempool_stats.funded_txo_sum,
-                spent_txo_sum: stats.mempool_stats.spent_txo_sum,
-                tx_count: stats.mempool_stats.tx_count,
-            },
-        })
+        let stats: EsploraAddressStats = self.get_json(&format!("/address/{address}")).await?;
+        Ok(stats.into())
     }
 
     async fn address_utxos(&self, address: &str) -> Result<Vec<WalletUtxo>, ChainError> {
-        let utxos: Vec<EsploraUtxo> = self
-            .get_json(&format!("/address/{address}/utxo"))
-            .await?;
+        let utxos: Vec<EsploraUtxo> = self.get_json(&format!("/address/{address}/utxo")).await?;
 
         Ok(utxos
             .into_iter()
@@ -197,9 +181,8 @@ impl ChainClient {
         &self,
         address: &str,
     ) -> Result<Vec<WalletTransaction>, ChainError> {
-        let transactions: Vec<EsploraTransaction> = self
-            .get_json(&format!("/address/{address}/txs"))
-            .await?;
+        let transactions: Vec<EsploraTransaction> =
+            self.get_json(&format!("/address/{address}/txs")).await?;
 
         Ok(transactions
             .iter()
@@ -209,11 +192,20 @@ impl ChainClient {
 
     async fn tip_height(&self) -> Result<u64, ChainError> {
         let height = self.get_text("/blocks/tip/height").await?;
-        height.trim().parse::<u64>().map_err(|_| ChainError::InvalidResponse)
+        height
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| ChainError::InvalidResponse)
     }
 
     async fn fee_estimates(&self) -> Result<FeeEstimates, ChainError> {
         let estimates: BTreeMap<String, f64> = self.get_json("/fee-estimates").await?;
+        if !estimates
+            .values()
+            .any(|rate| rate.is_finite() && *rate > 0.0)
+        {
+            return Err(ChainError::InvalidResponse);
+        }
         Ok(normalize_fee_estimates(&estimates))
     }
 
@@ -307,7 +299,10 @@ impl ChainClient {
             };
 
             if response.status().is_success() {
-                return response.text().await.map_err(|_| ChainError::InvalidResponse);
+                return response
+                    .text()
+                    .await
+                    .map_err(|_| ChainError::InvalidResponse);
             }
 
             let status = response.status();
@@ -350,6 +345,25 @@ struct EsploraStats {
     funded_txo_sum: u64,
     spent_txo_sum: u64,
     tx_count: u64,
+}
+
+impl From<EsploraStats> for AddressStats {
+    fn from(stats: EsploraStats) -> Self {
+        Self {
+            funded_txo_sum: stats.funded_txo_sum,
+            spent_txo_sum: stats.spent_txo_sum,
+            tx_count: stats.tx_count,
+        }
+    }
+}
+
+impl From<EsploraAddressStats> for AddressStatsSet {
+    fn from(stats: EsploraAddressStats) -> Self {
+        Self {
+            chain_stats: stats.chain_stats.into(),
+            mempool_stats: stats.mempool_stats.into(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -487,7 +501,117 @@ fn unix_timestamp() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use axum::{
+        extract::{Path, State},
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        routing::get,
+        Router,
+    };
+
     use super::*;
+
+    const TESTNET_ADDRESS: &str = "tb1q6rz28mcfaxtmd6v789l9rrlrusdprr9pqcpvkl";
+
+    #[derive(Clone)]
+    struct MockProvider {
+        stats: String,
+        utxos: String,
+        transactions: String,
+        fees: String,
+        fees_status: u16,
+        tip: String,
+        tip_status: u16,
+    }
+
+    impl MockProvider {
+        fn healthy() -> Self {
+            Self {
+                stats: serde_json::json!({
+                    "chain_stats": { "funded_txo_sum": 50_000, "spent_txo_sum": 10_000, "tx_count": 1 },
+                    "mempool_stats": { "funded_txo_sum": 2_000, "spent_txo_sum": 0, "tx_count": 1 }
+                })
+                .to_string(),
+                utxos: serde_json::json!([{
+                    "txid": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "vout": 0,
+                    "value": 40_000,
+                    "status": { "confirmed": true, "block_height": 849_990, "block_time": 1_700_000_000 }
+                }])
+                .to_string(),
+                transactions: serde_json::json!([{
+                    "txid": "2222222222222222222222222222222222222222222222222222222222222222",
+                    "fee": 200,
+                    "status": { "confirmed": true, "block_height": 849_990, "block_time": 1_700_000_000 },
+                    "vin": [{
+                        "prevout": { "scriptpubkey_address": "tb1qexternal", "value": 60_000 }
+                    }],
+                    "vout": [{ "scriptpubkey_address": "__ADDRESS__", "value": 40_000 }]
+                }])
+                .to_string(),
+                fees: serde_json::json!({
+                    "1": 1.01, "3": 1.4, "6": 1.2, "144": 1.0, "1008": 1.0
+                })
+                .to_string(),
+                fees_status: 200,
+                tip: "850000".to_owned(),
+                tip_status: 200,
+            }
+        }
+    }
+
+    async fn mock_stats(State(mock): State<MockProvider>) -> Response {
+        (StatusCode::OK, mock.stats).into_response()
+    }
+
+    async fn mock_utxos(State(mock): State<MockProvider>) -> Response {
+        (StatusCode::OK, mock.utxos).into_response()
+    }
+
+    async fn mock_transactions(
+        State(mock): State<MockProvider>,
+        Path(address): Path<String>,
+    ) -> Response {
+        (
+            StatusCode::OK,
+            mock.transactions.replace("__ADDRESS__", &address),
+        )
+            .into_response()
+    }
+
+    async fn mock_fees(State(mock): State<MockProvider>) -> Response {
+        (
+            StatusCode::from_u16(mock.fees_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            mock.fees,
+        )
+            .into_response()
+    }
+
+    async fn mock_tip(State(mock): State<MockProvider>) -> Response {
+        (
+            StatusCode::from_u16(mock.tip_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            mock.tip,
+        )
+            .into_response()
+    }
+
+    async fn spawn_provider(mock: MockProvider) -> String {
+        let app = Router::new()
+            .route("/address/{address}", get(mock_stats))
+            .route("/address/{address}/utxo", get(mock_utxos))
+            .route("/address/{address}/txs", get(mock_transactions))
+            .route("/fee-estimates", get(mock_fees))
+            .route("/blocks/tip/height", get(mock_tip))
+            .with_state(mock);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        format!("http://{address}")
+    }
 
     fn estimates(entries: &[(&str, f64)]) -> BTreeMap<String, f64> {
         entries
@@ -569,6 +693,129 @@ mod tests {
         assert_eq!(transaction.net_value, -6_000);
         assert_eq!(transaction.fee, Some(150));
         assert!(!transaction.status.confirmed);
+    }
+
+    #[test]
+    fn address_stats_parse_confirmed_and_mempool_totals() {
+        let stats: EsploraAddressStats = serde_json::from_str(
+            r#"{
+                "chain_stats": { "funded_txo_sum": 50000, "spent_txo_sum": 10000, "tx_count": 2 },
+                "mempool_stats": { "funded_txo_sum": 2000, "spent_txo_sum": 500, "tx_count": 1 }
+            }"#,
+        )
+        .unwrap();
+        let stats: AddressStatsSet = stats.into();
+
+        assert_eq!(stats.chain_stats.funded_txo_sum, 50000);
+        assert_eq!(stats.chain_stats.spent_txo_sum, 10000);
+        assert_eq!(stats.chain_stats.tx_count, 2);
+        assert_eq!(stats.mempool_stats.funded_txo_sum, 2000);
+        assert_eq!(stats.mempool_stats.spent_txo_sum, 500);
+        assert_eq!(stats.mempool_stats.tx_count, 1);
+    }
+
+    #[test]
+    fn incomplete_provider_responses_are_rejected() {
+        assert!(serde_json::from_str::<EsploraAddressStats>("{}").is_err());
+        assert!(serde_json::from_str::<EsploraAddressStats>(
+            r#"{"chain_stats":{"funded_txo_sum":1}}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<EsploraTransaction>(
+            r#"{"txid":"1111111111111111111111111111111111111111111111111111111111111111"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn transaction_parsing_classifies_incoming_and_pending_transactions() {
+        let transaction: EsploraTransaction = serde_json::from_str(
+            r#"{
+                "txid": "3333333333333333333333333333333333333333333333333333333333333333",
+                "fee": 180,
+                "status": { "confirmed": false },
+                "vin": [{
+                    "prevout": { "scriptpubkey_address": "tb1qexternal", "value": 30000 }
+                }],
+                "vout": [{ "scriptpubkey_address": "tb1qwallet", "value": 29820 }]
+            }"#,
+        )
+        .unwrap();
+        let transaction = transaction_for_address(&transaction, "tb1qwallet").unwrap();
+
+        assert_eq!(transaction.net_value, 29820);
+        assert_eq!(transaction.fee, Some(180));
+        assert!(!transaction.status.confirmed);
+        assert_eq!(transaction.status.block_height, None);
+    }
+
+    #[tokio::test]
+    async fn fee_provider_failures_do_not_break_wallet_snapshots() {
+        let mut mock = MockProvider::healthy();
+        mock.fees_status = 503;
+        let url = spawn_provider(mock).await;
+        let client = ChainClient::new(&url, None);
+
+        let snapshot = client
+            .wallet_snapshot(&[TESTNET_ADDRESS.to_owned()])
+            .await
+            .unwrap();
+
+        assert!(snapshot.fees.is_none());
+        assert_eq!(snapshot.tip_height, 850_000);
+        assert_eq!(
+            snapshot.addresses[0].stats.chain_stats.funded_txo_sum,
+            50_000
+        );
+        assert_eq!(snapshot.addresses[0].transactions[0].net_value, 40_000);
+    }
+
+    #[tokio::test]
+    async fn empty_fee_estimates_are_treated_as_unavailable() {
+        let mut mock = MockProvider::healthy();
+        mock.fees = "{}".to_owned();
+        let url = spawn_provider(mock).await;
+        let client = ChainClient::new(&url, None);
+
+        let snapshot = client
+            .wallet_snapshot(&[TESTNET_ADDRESS.to_owned()])
+            .await
+            .unwrap();
+
+        assert!(snapshot.fees.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_status_errors_are_reported() {
+        let mut mock = MockProvider::healthy();
+        mock.tip_status = 503;
+        let url = spawn_provider(mock).await;
+        let client = ChainClient::new(&url, None);
+
+        let result = client.wallet_snapshot(&[TESTNET_ADDRESS.to_owned()]).await;
+
+        assert!(matches!(result, Err(ChainError::ProviderStatus(503))));
+    }
+
+    #[tokio::test]
+    async fn malformed_address_data_is_reported() {
+        let mut mock = MockProvider::healthy();
+        mock.stats = "{}".to_owned();
+        let url = spawn_provider(mock).await;
+        let client = ChainClient::new(&url, None);
+
+        let result = client.wallet_snapshot(&[TESTNET_ADDRESS.to_owned()]).await;
+
+        assert!(matches!(result, Err(ChainError::InvalidResponse)));
+    }
+
+    #[tokio::test]
+    async fn unreachable_providers_are_reported_as_unavailable() {
+        let client = ChainClient::new("http://127.0.0.1:1", None);
+
+        let result = client.wallet_snapshot(&[TESTNET_ADDRESS.to_owned()]).await;
+
+        assert!(matches!(result, Err(ChainError::Unavailable)));
     }
 
     #[test]

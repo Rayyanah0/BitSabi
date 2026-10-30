@@ -14,8 +14,8 @@ pub use app_shell::AppShell;
 pub use bottom_navigation::BottomNavigation;
 pub use brand::Brand;
 pub use icons::{
-    ArrowLeftIcon, ArrowRightIcon, BitcoinIcon, BookIcon, CheckIcon, ClockIcon, CopyIcon, HomeIcon,
-    ExternalLinkIcon, ImportIcon, NairaIcon, NetworkIcon, RefreshIcon, SendReceiveIcon,
+    ArrowLeftIcon, ArrowRightIcon, BitcoinIcon, BookIcon, CheckIcon, ClockIcon, CopyIcon,
+    ExternalLinkIcon, HomeIcon, ImportIcon, NairaIcon, NetworkIcon, RefreshIcon, SendReceiveIcon,
     SettingsIcon, ShieldIcon, WalletIcon, WarningIcon,
 };
 pub use lesson_card::LessonCard;
