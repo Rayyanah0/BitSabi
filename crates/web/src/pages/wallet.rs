@@ -21,6 +21,18 @@ use crate::{
 
 const HISTORY_PAGE_SIZE: usize = 8;
 const OVERVIEW_TX_LIMIT: usize = 3;
+/// Simulated BTC/NGN rate used only for informational display in the send form.
+const MOCK_BTC_NGN_RATE: f64 = 165_000_000.0;
+/// Testnet4 faucet URL shown in the Receive panel.
+const TESTNET_FAUCET_URL: &str = "https://testnet-faucet.mempool.co";
+/// Fallback fee rates used when the public testnet provider returns an empty fee map `{}`.
+const DEFAULT_TESTNET_FEES: FeeEstimates = FeeEstimates {
+    fastest_sat_vb: 2,
+    half_hour_sat_vb: 2,
+    hour_sat_vb: 1,
+    economy_sat_vb: 1,
+    minimum_sat_vb: 1,
+};
 #[cfg(target_arch = "wasm32")]
 const AUTO_REFRESH_INTERVAL_MS: u32 = 60_000;
 
@@ -29,6 +41,7 @@ enum WalletStage {
     Landing,
     Create,
     Import,
+    CreatePassword,
     Ready,
 }
 
@@ -44,6 +57,7 @@ enum WalletPanel {
     Receive,
     Send,
     History,
+    SeedSecurity,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,12 +94,28 @@ enum BroadcastState {
 
 #[component]
 pub fn Wallet() -> Element {
-    let mut stage = use_signal(|| WalletStage::Landing);
+    let mut stage = use_signal(|| {
+        if crate::wallet_persistence::load_active_phrase().is_some() {
+            WalletStage::Ready
+        } else {
+            WalletStage::Landing
+        }
+    });
     let mut created_wallet = use_signal(|| None::<crate::wallet::CreatedWallet>);
     let mut import_phrase = use_signal(|| Zeroizing::new(String::new()));
     let mut backup_confirmed = use_signal(|| false);
-    let mut session = use_signal(|| None::<WalletSession>);
-    let mut source = use_signal(|| None::<WalletSource>);
+    let mut session = use_signal(|| {
+        crate::wallet_persistence::load_active_phrase()
+            .and_then(|phrase| WalletSession::from_phrase(&phrase).ok())
+    });
+    let mut source = use_signal(|| {
+        if crate::wallet_persistence::load_active_phrase().is_some() {
+            Some(WalletSource::Created)
+        } else {
+            None
+        }
+    });
+    let mut pending_wallet = use_signal(|| None::<(WalletSource, Zeroizing<String>)>);
     let mut wallet_error = use_signal(|| None::<String>);
     let mut copy_state = use_signal(|| CopyState::Idle);
     let mut copied_address = use_signal(|| None::<String>);
@@ -105,23 +135,66 @@ pub fn Wallet() -> Element {
     let mut broadcast_state = use_signal(|| BroadcastState::Idle);
     let mut sending = use_signal(|| false);
     let mut visible_tx_count = use_signal(|| HISTORY_PAGE_SIZE);
-    let mut persist_password = use_signal(String::new);
     let mut persist_message = use_signal(|| None::<String>);
-    let mut unlock_password = use_signal(String::new);
-    let mut has_saved_wallet = use_signal(|| crate::wallet_persistence::load_wallet().is_some());
-    let mut confirm_overwrite_saved = use_signal(|| false);
-    let mut confirm_remove_saved = use_signal(|| false);
+
+    // Create password (for wallet security) & seed phrase vault state
+    let mut setup_password = use_signal(String::new);
+    let mut setup_confirm_password = use_signal(String::new);
+    let mut auth_gate_error = use_signal(|| None::<String>);
+    let mut encrypted_envelope =
+        use_signal(crate::wallet_persistence::load_wallet);
+    let mut seed_current_password = use_signal(String::new);
+    let mut seed_new_password = use_signal(String::new);
+    let mut seed_confirm_password = use_signal(String::new);
+    let mut seed_auth_error = use_signal(|| None::<String>);
+    let mut seed_auth_success = use_signal(|| None::<String>);
+    let mut revealed_phrase = use_signal(|| None::<Zeroizing<String>>);
 
     let import_word_count = import_phrase.read().split_whitespace().count();
+
+    let mut lock_seed_view = move || {
+        revealed_phrase.set(None);
+        seed_current_password.set(String::new());
+        seed_new_password.set(String::new());
+        seed_confirm_password.set(String::new());
+        seed_auth_error.set(None);
+        seed_auth_success.set(None);
+    };
+
+    // Automatically load wallet balance & simulated payments transactions when entering Ready stage
+    use_effect(move || {
+        if stage() == WalletStage::Ready && summary.read().is_none() && !loading() {
+            let addresses = session
+                .read()
+                .as_ref()
+                .map(WalletSession::scan_addresses)
+                .unwrap_or_default();
+            if !addresses.is_empty() {
+                request_wallet_refresh(
+                    addresses,
+                    true,
+                    snapshot,
+                    summary,
+                    loading,
+                    refresh_error,
+                    refresh_id,
+                );
+            }
+        }
+    });
 
     let reset_to_landing = use_callback(move |()| {
         refresh_id.set(refresh_id().wrapping_add(1));
         session.set(None);
         created_wallet.set(None);
+        pending_wallet.set(None);
         import_phrase.set(Zeroizing::new(String::new()));
         backup_confirmed.set(false);
         source.set(None);
         wallet_error.set(None);
+        auth_gate_error.set(None);
+        setup_password.set(String::new());
+        setup_confirm_password.set(String::new());
         copy_state.set(CopyState::Idle);
         copied_address.set(None);
         panel.set(WalletPanel::Overview);
@@ -139,9 +212,15 @@ pub fn Wallet() -> Element {
         broadcast_state.set(BroadcastState::Idle);
         sending.set(false);
         visible_tx_count.set(HISTORY_PAGE_SIZE);
-        confirm_overwrite_saved.set(false);
-        confirm_remove_saved.set(false);
+        persist_message.set(None);
+        lock_seed_view();
         stage.set(WalletStage::Landing);
+    });
+
+    let reset_wallet = use_callback(move |()| {
+        crate::wallet_persistence::clear_wallet();
+        encrypted_envelope.set(None);
+        reset_to_landing.call(());
     });
 
     let begin_wallet = use_callback(
@@ -149,7 +228,9 @@ pub fn Wallet() -> Element {
             let addresses = new_session.scan_addresses();
             session.set(Some(new_session));
             source.set(Some(new_source));
+            pending_wallet.set(None);
             wallet_error.set(None);
+            auth_gate_error.set(None);
             copy_state.set(CopyState::Idle);
             copied_address.set(None);
             panel.set(WalletPanel::Overview);
@@ -166,6 +247,7 @@ pub fn Wallet() -> Element {
             broadcast_state.set(BroadcastState::Idle);
             sending.set(false);
             visible_tx_count.set(HISTORY_PAGE_SIZE);
+            lock_seed_view();
             stage.set(WalletStage::Ready);
             request_wallet_refresh(
                 addresses,
@@ -178,78 +260,6 @@ pub fn Wallet() -> Element {
             );
         },
     );
-
-    let unlock_saved_wallet = use_callback(move |()| {
-        if session.read().is_some() {
-            persist_message.set(Some(
-                "A wallet is already open. Start over before unlocking a saved wallet.".to_owned(),
-            ));
-            return;
-        }
-        let password = unlock_password.read().clone();
-        match crate::wallet_persistence::load_wallet() {
-            Some(envelope) => {
-                match crate::wallet_persistence::decrypt_bytes(&envelope, &password) {
-                    Ok(seed) => match WalletSession::from_seed_bytes(&seed) {
-                        Ok(new_session) => {
-                            unlock_password.set(String::new());
-                            persist_message.set(None);
-                            begin_wallet.call((new_session, WalletSource::Imported));
-                        }
-                        Err(error) => persist_message.set(Some(error.to_string())),
-                    },
-                    Err(error) => persist_message.set(Some(error.to_string())),
-                }
-            }
-            None => persist_message.set(Some("No saved wallet was found.".to_owned())),
-        }
-    });
-
-    let save_wallet_to_browser = use_callback(move |()| {
-        if has_saved_wallet() && !confirm_overwrite_saved() {
-            confirm_overwrite_saved.set(true);
-            persist_message.set(Some(
-                "A saved wallet already exists. Press \"Save wallet\" again to overwrite it, or cancel."
-                    .to_owned(),
-            ));
-            return;
-        }
-        confirm_overwrite_saved.set(false);
-
-        let password = persist_password.read().clone();
-        let seed = session.read().as_ref().map(WalletSession::export_seed);
-        let Some(seed) = seed else {
-            persist_message.set(Some("No wallet session is available.".to_owned()));
-            return;
-        };
-        match crate::wallet_persistence::encrypt_bytes(&seed, &password) {
-            Ok(envelope) => match crate::wallet_persistence::save_wallet(&envelope) {
-                Ok(()) => {
-                    has_saved_wallet.set(true);
-                    persist_password.set(String::new());
-                    confirm_overwrite_saved.set(false);
-                    persist_message.set(Some("Wallet saved in encrypted form.".to_owned()));
-                }
-                Err(error) => persist_message.set(Some(error.to_string())),
-            },
-            Err(error) => persist_message.set(Some(error.to_string())),
-        }
-    });
-
-    let remove_saved_wallet = use_callback(move |()| {
-        if !confirm_remove_saved() {
-            confirm_remove_saved.set(true);
-            persist_message.set(Some(
-                "Confirm deletion of the saved wallet. This does not close the open wallet, but you will need your recovery phrase to restore it later."
-                    .to_owned(),
-            ));
-            return;
-        }
-        confirm_remove_saved.set(false);
-        crate::wallet_persistence::clear_wallet();
-        has_saved_wallet.set(false);
-        persist_message.set(Some("Saved wallet removed.".to_owned()));
-    });
 
     let start_create = use_callback(move |()| {
         reset_to_landing.call(());
@@ -273,19 +283,25 @@ pub fn Wallet() -> Element {
     });
 
     let import_wallet = use_callback(move |()| {
-        let result = {
-            let phrase = import_phrase.read();
-            if phrase.trim().is_empty() {
-                Err("Enter a 12- or 24-word recovery phrase.".to_owned())
-            } else {
-                WalletSession::from_phrase(phrase.as_str()).map_err(|error| error.to_string())
-            }
+        let phrase_str = import_phrase.read().trim().to_owned();
+        let result = if phrase_str.is_empty() {
+            Err("Enter a 12- or 24-word recovery phrase.".to_owned())
+        } else {
+            WalletSession::from_phrase(&phrase_str).map_err(|error| error.to_string())
         };
 
         match result {
-            Ok(new_session) => {
+            Ok(_new_session) => {
                 import_phrase.set(Zeroizing::new(String::new()));
-                begin_wallet.call((new_session, WalletSource::Imported));
+                wallet_error.set(None);
+                auth_gate_error.set(None);
+                setup_password.set(String::new());
+                setup_confirm_password.set(String::new());
+                pending_wallet.set(Some((
+                    WalletSource::Imported,
+                    Zeroizing::new(phrase_str),
+                )));
+                stage.set(WalletStage::CreatePassword);
             }
             Err(message) => wallet_error.set(Some(message)),
         }
@@ -296,23 +312,148 @@ pub fn Wallet() -> Element {
             return;
         }
 
-        let result = {
+        let (result, phrase_copy) = {
             let wallet = created_wallet.read();
             let Some(wallet) = wallet.as_ref() else {
                 return;
             };
-            WalletSession::from_phrase(wallet.phrase())
+            let phrase_str = wallet.phrase().to_owned();
+            (WalletSession::from_phrase(&phrase_str), phrase_str)
         };
 
         match result {
-            Ok(new_session) => {
+            Ok(_new_session) => {
                 created_wallet.set(None);
                 backup_confirmed.set(false);
-                begin_wallet.call((new_session, WalletSource::Created));
+                wallet_error.set(None);
+                auth_gate_error.set(None);
+                setup_password.set(String::new());
+                setup_confirm_password.set(String::new());
+                pending_wallet.set(Some((
+                    WalletSource::Created,
+                    Zeroizing::new(phrase_copy),
+                )));
+                stage.set(WalletStage::CreatePassword);
             }
             Err(error) => {
                 wallet_error.set(Some(error.to_string()));
             }
+        }
+    });
+
+    let complete_password_setup = use_callback(move |()| {
+        auth_gate_error.set(None);
+        wallet_error.set(None);
+        let pwd = setup_password.read().clone();
+        let confirm = setup_confirm_password.read().clone();
+        if pwd.chars().count() < crate::wallet_persistence::MIN_PASSWORD_LEN {
+            auth_gate_error.set(Some(format!(
+                "Password must be at least {} characters long.",
+                crate::wallet_persistence::MIN_PASSWORD_LEN
+            )));
+            return;
+        }
+        if pwd != confirm {
+            auth_gate_error.set(Some(
+                "Passwords do not match. Enter the same password in both fields.".to_owned(),
+            ));
+            return;
+        }
+
+        let (new_source, phrase_copy) =
+            if let Some(pending) = pending_wallet.read().clone() {
+                pending
+            } else {
+                match crate::wallet::create_testnet_wallet() {
+                    Ok(wallet) => (
+                        WalletSource::Created,
+                        Zeroizing::new(wallet.phrase().to_owned()),
+                    ),
+                    Err(error) => {
+                        auth_gate_error.set(Some(error.to_string()));
+                        return;
+                    }
+                }
+            };
+
+        let new_session = match WalletSession::from_phrase(phrase_copy.as_str()) {
+            Ok(s) => s,
+            Err(error) => {
+                auth_gate_error.set(Some(error.to_string()));
+                return;
+            }
+        };
+
+        match crate::wallet_persistence::encrypt_wallet(phrase_copy.as_str(), &pwd) {
+            Ok(envelope) => {
+                let _ = crate::wallet_persistence::save_wallet(&envelope);
+                crate::wallet_persistence::save_active_phrase(phrase_copy.as_str());
+                encrypted_envelope.set(Some(envelope));
+                setup_password.set(String::new());
+                setup_confirm_password.set(String::new());
+                begin_wallet.call((new_session, new_source));
+            }
+            Err(error) => {
+                auth_gate_error.set(Some(error.to_string()));
+            }
+        }
+    });
+
+    let unlock_and_update_seed_password = use_callback(move |()| {
+        seed_auth_error.set(None);
+        seed_auth_success.set(None);
+
+        let current_pwd = seed_current_password.read().clone();
+        let new_pwd = seed_new_password.read().clone();
+        let confirm_pwd = seed_confirm_password.read().clone();
+
+        if current_pwd.is_empty() {
+            seed_auth_error.set(Some(
+                "Enter your current wallet password to verify your identity.".to_owned(),
+            ));
+            return;
+        }
+        if new_pwd.chars().count() < crate::wallet_persistence::MIN_PASSWORD_LEN {
+            seed_auth_error.set(Some(format!(
+                "Enter a new updated password of at least {} characters to unlock the seed phrase.",
+                crate::wallet_persistence::MIN_PASSWORD_LEN
+            )));
+            return;
+        }
+        if new_pwd != confirm_pwd {
+            seed_auth_error.set(Some(
+                "The new password and confirmation password do not match.".to_owned(),
+            ));
+            return;
+        }
+
+        let Some(envelope) = encrypted_envelope.read().clone() else {
+            seed_auth_error.set(Some(
+                "No encrypted seed phrase envelope is stored for this session.".to_owned(),
+            ));
+            return;
+        };
+
+        match crate::wallet_persistence::decrypt_wallet(&envelope, &current_pwd) {
+            Ok(phrase) => {
+                match crate::wallet_persistence::encrypt_wallet(phrase.as_str(), &new_pwd) {
+                    Ok(updated_envelope) => {
+                        let _ = crate::wallet_persistence::save_wallet(&updated_envelope);
+                        crate::wallet_persistence::save_active_phrase(phrase.as_str());
+                        encrypted_envelope.set(Some(updated_envelope));
+                        revealed_phrase.set(Some(phrase));
+                        seed_current_password.set(String::new());
+                        seed_new_password.set(String::new());
+                        seed_confirm_password.set(String::new());
+                        seed_auth_success.set(Some(
+                            "Password verified and updated! Your seed phrase and derivation details are now unlocked below."
+                                .to_owned(),
+                        ));
+                    }
+                    Err(error) => seed_auth_error.set(Some(error.to_string())),
+                }
+            }
+            Err(error) => seed_auth_error.set(Some(error.to_string())),
         }
     });
 
@@ -407,7 +548,11 @@ pub fn Wallet() -> Element {
         let amount_text = send_amount.read().trim().to_owned();
         let fee_choice_value = fee_choice();
         let custom_fee = custom_fee_rate.read().trim().to_owned();
-        let Some(fees) = snapshot.read().as_ref().and_then(|snapshot| snapshot.fees) else {
+        let Some(fees) = snapshot
+            .read()
+            .as_ref()
+            .map(|snapshot| snapshot.fees.unwrap_or(DEFAULT_TESTNET_FEES))
+        else {
             send_error.set(Some(
                 "Load the wallet balance and fee estimates before sending.".to_owned(),
             ));
@@ -570,9 +715,9 @@ pub fn Wallet() -> Element {
                     p { class: "eyebrow", "My Wallet" }
                     span { class: "pill pill--orange", "Bitcoin testnet" }
                 }
-                h1 { "A testnet wallet you control" }
+                h1 { "Create or import your testnet wallet" }
                 p {
-                    "Create or import a wallet, track its balance, receive with a QR code, and send testnet bitcoin signed in this browser."
+                    "Start by creating a new 12-word wallet or importing an existing recovery phrase. Next, you will set a wallet password for wallet security on a separate page."
                 }
             }
 
@@ -580,57 +725,8 @@ pub fn Wallet() -> Element {
                 div { class: "wallet-alert wallet-alert--error", role: "alert",
                     WarningIcon {}
                     div {
-                        strong { "Wallet not created" }
+                        strong { "Wallet error" }
                         p { "{message}" }
-                    }
-                }
-            }
-
-            div { class: "wallet-banner",
-                div { class: "wallet-banner__icon", WalletIcon {} }
-                div {
-                    h2 { "A full testnet wallet" }
-                    p {
-                        "Balances, multiple receiving addresses, fee-aware sends, and transaction history. Testnet coins have no real value."
-                    }
-                }
-            }
-
-            if has_saved_wallet() {
-                section { class: "wallet-panel",
-                    div { class: "wallet-panel__header",
-                        div {
-                            h2 { "Unlock saved wallet" }
-                            p { "This browser has an encrypted wallet. Enter its password to restore the session." }
-                        }
-                    }
-                    if let Some(message) = persist_message.read().as_ref() {
-                        p { class: "wallet-error", role: "alert", "{message}" }
-                    }
-                    form {
-                        class: "wallet-form",
-                        onsubmit: move |event| {
-                            event.prevent_default();
-                            unlock_saved_wallet.call(());
-                        },
-                        div { class: "wallet-field",
-                            label { r#for: "wallet-unlock-password", "Password" }
-                            input {
-                                id: "wallet-unlock-password",
-                                class: "wallet-input",
-                                r#type: "password",
-                                value: "{unlock_password.read()}",
-                                oninput: move |event| unlock_password.set(event.value()),
-                                autocomplete: "current-password",
-                            }
-                        }
-                        div { class: "wallet-flow__actions",
-                            button {
-                                class: "button button--primary",
-                                r#type: "submit",
-                                "Unlock wallet"
-                            }
-                        }
                     }
                 }
             }
@@ -638,9 +734,10 @@ pub fn Wallet() -> Element {
             div { class: "wallet-actions",
                 section { class: "wallet-action-card",
                     div { class: "wallet-action-card__icon", WalletIcon {} }
+                    span { class: "pill pill--orange", "New wallet · Create & Export" }
                     h2 { "Create a new wallet" }
                     p {
-                        "Generate 12 recovery words in your browser, then use the wallet to receive and send testnet bitcoin."
+                        "Generate 12 recovery words in your browser, export your phrase backup, and then set your wallet security password."
                     }
                     PrimaryButton {
                         onclick: move |_| start_create.call(()),
@@ -650,9 +747,10 @@ pub fn Wallet() -> Element {
 
                 section { class: "wallet-action-card",
                     div { class: "wallet-action-card__icon", ImportIcon {} }
+                    span { class: "pill", "Restore existing" }
                     h2 { "Import a wallet" }
                     p {
-                        "Enter a 12- or 24-word English BIP39 recovery phrase you already use for testnet."
+                        "Enter a 12- or 24-word English BIP39 recovery phrase, and then set your wallet security password on the next page."
                     }
                     SecondaryButton {
                         onclick: move |_| start_import.call(()),
@@ -664,92 +762,118 @@ pub fn Wallet() -> Element {
             aside { class: "wallet-safety",
                 ShieldIcon {}
                 div {
-                    strong { "Keys stay in this tab only." }
+                    strong { "Keys are generated locally in your browser." }
                     p {
-                        "BitSabi never saves wallet words or keys. Refreshing or closing the tab clears the wallet, so back up your recovery phrase."
+                        "BitSabi never sends your recovery phrase or wallet password to the server."
                     }
                 }
             }
         },
 
-        WalletStage::Create => rsx! {
-            header { class: "page-header",
-                div { class: "page-header__meta",
-                    p { class: "eyebrow", "Create wallet" }
-                    span { class: "pill pill--orange", "Bitcoin testnet" }
-                }
-                h1 { "Write down your recovery phrase" }
-                p {
-                    "These 12 words can restore this wallet. Write them down in order and keep them private."
-                }
-            }
-
-            div { class: "wallet-alert wallet-alert--warning",
-                WarningIcon {}
-                div {
-                    strong { "Anyone with these words can control the wallet." }
+        WalletStage::Create => {
+            let current_copy_state = copy_state();
+            let current_copied_address = copied_address.read().clone();
+            rsx! {
+                header { class: "page-header",
+                    div { class: "page-header__meta",
+                        p { class: "eyebrow", "Create & Export Wallet" }
+                        span { class: "pill pill--orange", "Step 1 of 2" }
+                    }
+                    h1 { "Write down or export your recovery phrase" }
                     p {
-                        "BitSabi cannot recover the phrase for you. Do not share it, screenshot it, or send it to anyone."
+                        "These 12 words can restore this wallet. Export or write them down in order, then continue to the next page to create your wallet security password."
                     }
                 }
-            }
 
-            if let Some(wallet) = created_wallet.read().as_ref() {
-                section { class: "wallet-recovery", aria_label: "Recovery phrase",
-                    ol { class: "recovery-words",
-                        for (index, word) in wallet.phrase().split_whitespace().enumerate() {
-                            li { key: "{index}",
-                                span { class: "recovery-words__number", "{index + 1}" }
-                                span { class: "recovery-words__word", "{word}" }
+                div { class: "wallet-alert wallet-alert--warning",
+                    WarningIcon {}
+                    div {
+                        strong { "Anyone with these words can control the wallet." }
+                        p {
+                            "BitSabi cannot recover the phrase for you. Keep your exported backup somewhere private and offline."
+                        }
+                    }
+                }
+
+                if let Some(wallet) = created_wallet.read().as_ref() {
+                    {
+                        let phrase_to_export = wallet.phrase().to_owned();
+                        let is_phrase_copied = current_copy_state == CopyState::Copied
+                            && current_copied_address.as_deref() == Some(phrase_to_export.as_str());
+                        rsx! {
+                            section { class: "wallet-recovery", aria_label: "Recovery phrase",
+                                ol { class: "recovery-words",
+                                    for (index, word) in wallet.phrase().split_whitespace().enumerate() {
+                                        li { key: "{index}",
+                                            span { class: "recovery-words__number", "{index + 1}" }
+                                            span { class: "recovery-words__word", "{word}" }
+                                        }
+                                    }
+                                }
+                                div { class: "wallet-flow__actions",
+                                    SecondaryButton {
+                                        onclick: move |_| copy_text_to_clipboard(
+                                            phrase_to_export.clone(),
+                                            copy_state,
+                                            copied_address,
+                                        ),
+                                        CopyIcon {}
+                                        if is_phrase_copied {
+                                            "Exported / Copied to clipboard"
+                                        } else {
+                                            "Export / Copy 12-word phrase"
+                                        }
+                                    }
+                                }
+                                p { class: "wallet-recovery__note",
+                                    "After you confirm your backup, you will go to the next page to create a password for wallet security."
+                                }
                             }
                         }
                     }
-                    p { class: "wallet-recovery__note",
-                        "This phrase is shown only during this flow. After you continue, the signing key stays in this tab's memory so you can send. Refreshing clears it."
-                    }
-                }
 
-                if let Some(message) = wallet_error.read().as_ref() {
-                    p { class: "wallet-error", role: "alert", "{message}" }
-                }
+                    if let Some(message) = wallet_error.read().as_ref() {
+                        p { class: "wallet-error", role: "alert", "{message}" }
+                    }
 
-                label { class: "wallet-confirm",
-                    input {
-                        r#type: "checkbox",
-                        checked: backup_confirmed(),
-                        onchange: move |event| backup_confirmed.set(event.checked()),
+                    label { class: "wallet-confirm",
+                        input {
+                            r#type: "checkbox",
+                            checked: backup_confirmed(),
+                            onchange: move |event| backup_confirmed.set(event.checked()),
+                        }
+                        span {
+                            strong { "I have written down or exported these 12 words in order." }
+                            small { "I understand BitSabi cannot recover them for me." }
+                        }
                     }
-                    span {
-                        strong { "I have written down these 12 words in order." }
-                        small { "I understand BitSabi cannot recover them for me." }
-                    }
-                }
 
-                div { class: "wallet-flow__actions",
-                    SecondaryButton {
-                        onclick: move |_| reset_to_landing.call(()),
-                        ArrowLeftIcon {}
-                        "Cancel"
+                    div { class: "wallet-flow__actions",
+                        SecondaryButton {
+                            onclick: move |_| reset_to_landing.call(()),
+                            ArrowLeftIcon {}
+                            "Back"
+                        }
+                        PrimaryButton {
+                            disabled: !backup_confirmed(),
+                            onclick: move |_| confirm_backup.call(()),
+                            "Continue to create password"
+                        }
                     }
-                    PrimaryButton {
-                        disabled: !backup_confirmed(),
-                        onclick: move |_| confirm_backup.call(()),
-                        "Continue to wallet"
+                } else {
+                    div { class: "wallet-alert wallet-alert--error", role: "alert",
+                        WarningIcon {}
+                        div {
+                            strong { "Wallet state was cleared." }
+                            p { "Start again to generate a new recovery phrase." }
+                        }
                     }
-                }
-            } else {
-                div { class: "wallet-alert wallet-alert--error", role: "alert",
-                    WarningIcon {}
-                    div {
-                        strong { "Wallet state was cleared." }
-                        p { "Start again to generate a new recovery phrase." }
-                    }
-                }
-                div { class: "wallet-flow__actions",
-                    SecondaryButton {
-                        onclick: move |_| reset_to_landing.call(()),
-                        ArrowLeftIcon {}
-                        "Back to wallet"
+                    div { class: "wallet-flow__actions",
+                        SecondaryButton {
+                            onclick: move |_| reset_to_landing.call(()),
+                            ArrowLeftIcon {}
+                            "Back to wallet"
+                        }
                     }
                 }
             }
@@ -758,12 +882,12 @@ pub fn Wallet() -> Element {
         WalletStage::Import => rsx! {
             header { class: "page-header",
                 div { class: "page-header__meta",
-                    p { class: "eyebrow", "Import wallet" }
-                    span { class: "pill pill--orange", "Bitcoin testnet" }
+                    p { class: "eyebrow", "Import Wallet" }
+                    span { class: "pill pill--orange", "Step 1 of 2" }
                 }
                 h1 { "Restore a testnet wallet" }
                 p {
-                    "Enter your 12- or 24-word English BIP39 recovery phrase. It is checked locally and never sent to the server."
+                    "Enter your 12- or 24-word English BIP39 recovery phrase. Next, you will create a password for wallet security on the following page."
                 }
             }
 
@@ -784,7 +908,20 @@ pub fn Wallet() -> Element {
                     import_wallet.call(());
                 },
                 div { class: "wallet-field",
-                    label { r#for: "wallet-import-phrase", "Recovery phrase" }
+                    div { class: "wallet-field__meta",
+                        label { r#for: "wallet-import-phrase", "Recovery phrase" }
+                        button {
+                            class: "button button--secondary button--compact",
+                            r#type: "button",
+                            onclick: move |_| {
+                                import_phrase.set(Zeroizing::new(
+                                    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned(),
+                                ));
+                                wallet_error.set(None);
+                            },
+                            "Fill sample test phrase"
+                        }
+                    }
                     textarea {
                         id: "wallet-import-phrase",
                         class: if wallet_error.read().is_some() {
@@ -830,13 +967,113 @@ pub fn Wallet() -> Element {
                     SecondaryButton {
                         onclick: move |_| reset_to_landing.call(()),
                         ArrowLeftIcon {}
-                        "Cancel"
+                        "Back"
                     }
                     button {
                         class: "button button--primary",
                         r#type: "submit",
                         disabled: import_word_count == 0,
-                        "Import wallet"
+                        "Continue to create password"
+                    }
+                }
+            }
+        },
+
+        WalletStage::CreatePassword => {
+            rsx! {
+                header { class: "page-header",
+                    div { class: "page-header__meta",
+                        p { class: "eyebrow", "Already Created Wallet · Wallet Security" }
+                        span { class: "pill pill--orange", "Step 2 of 2 · Create Password" }
+                    }
+                    h1 { "Create password for wallet security" }
+                    p {
+                        "Your wallet is ready. Create a password below to encrypt and protect your wallet security before opening it."
+                    }
+                }
+
+                section { class: "wallet-panel",
+                    div { class: "wallet-panel__header",
+                        div {
+                            h2 { "Create password (for wallet security)" }
+                            p {
+                                "Set a strong password to encrypt your wallet in the browser using Argon2id + AES-256-GCM. Anytime you return to view your seed phrase, you will verify and update this password."
+                            }
+                        }
+                        span { class: "pill pill--orange", "Wallet security" }
+                    }
+
+                    if let Some(message) = auth_gate_error.read().as_ref() {
+                        div { class: "wallet-alert wallet-alert--error", role: "alert",
+                            WarningIcon {}
+                            div {
+                                strong { "Password check failed" }
+                                p { "{message}" }
+                            }
+                        }
+                    }
+
+                    form {
+                        class: "wallet-form",
+                        onsubmit: move |event| {
+                            event.prevent_default();
+                            complete_password_setup.call(());
+                        },
+                        div { class: "wallet-form-grid",
+                            div { class: "wallet-field",
+                                label { r#for: "wallet-setup-password", "Create password (min 8 characters)" }
+                                input {
+                                    id: "wallet-setup-password",
+                                    class: "wallet-input",
+                                    r#type: "password",
+                                    placeholder: "Enter at least 8 characters",
+                                    value: "{setup_password.read()}",
+                                    autocomplete: "new-password",
+                                    oninput: move |event| {
+                                        setup_password.set(event.value());
+                                        auth_gate_error.set(None);
+                                    },
+                                }
+                            }
+                            div { class: "wallet-field",
+                                label { r#for: "wallet-setup-confirm-password", "Confirm password" }
+                                input {
+                                    id: "wallet-setup-confirm-password",
+                                    class: "wallet-input",
+                                    r#type: "password",
+                                    placeholder: "Re-enter your password",
+                                    value: "{setup_confirm_password.read()}",
+                                    autocomplete: "new-password",
+                                    oninput: move |event| {
+                                        setup_confirm_password.set(event.value());
+                                        auth_gate_error.set(None);
+                                    },
+                                }
+                            }
+                        }
+                        div { class: "wallet-flow__actions",
+                            SecondaryButton {
+                                onclick: move |_| reset_to_landing.call(()),
+                                ArrowLeftIcon {}
+                                "Back to Create / Import"
+                            }
+                            button {
+                                class: "button button--primary",
+                                r#type: "submit",
+                                ShieldIcon {}
+                                "Create password & open wallet"
+                            }
+                        }
+                    }
+                }
+
+                aside { class: "wallet-safety",
+                    ShieldIcon {}
+                    div {
+                        strong { "Encrypted in your browser with Argon2id + AES-256-GCM." }
+                        p {
+                            "BitSabi never sends your password or seed phrase to the server. Anytime you return to inspect your seed phrase, you must verify and update your password."
+                        }
                     }
                 }
             }
@@ -862,7 +1099,9 @@ pub fn Wallet() -> Element {
             let (snapshot_fees, last_updated) = {
                 let snapshot = snapshot.read();
                 (
-                    snapshot.as_ref().and_then(|snapshot| snapshot.fees),
+                    snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.fees.unwrap_or(DEFAULT_TESTNET_FEES)),
                     snapshot.as_ref().map(|snapshot| snapshot.fetched_at),
                 )
             };
@@ -875,6 +1114,20 @@ pub fn Wallet() -> Element {
                 .as_ref()
                 .map_or(0, |summary| summary.transactions.len());
             let visible_history = visible_tx_count().min(history_count);
+            let unlocked_seed = revealed_phrase.read().clone();
+            let seed_words: Vec<String> = unlocked_seed
+                .as_ref()
+                .map(|p| p.split_whitespace().map(str::to_owned).collect())
+                .unwrap_or_default();
+            let seed_word_count = seed_words.len();
+            let seed_phrase_to_copy = unlocked_seed
+                .as_ref()
+                .map(|p| p.as_str().to_owned())
+                .unwrap_or_default();
+            let first_receive_address = receive_addresses
+                .first()
+                .map(|(_, addr)| addr.clone())
+                .unwrap_or_else(|| "—".to_owned());
 
             rsx! {
                 header { class: "page-header",
@@ -916,8 +1169,8 @@ pub fn Wallet() -> Element {
                             if loading() { "Refreshing" } else { "Refresh" }
                         }
                         SecondaryButton {
-                            onclick: move |_| reset_to_landing.call(()),
-                            "Start over"
+                            onclick: move |_| reset_wallet.call(()),
+                            "Reset wallet"
                         }
                     }
                 }
@@ -926,26 +1179,47 @@ pub fn Wallet() -> Element {
                     button {
                         class: tab_class(active_panel == WalletPanel::Overview),
                         r#type: "button",
-                        onclick: move |_| panel.set(WalletPanel::Overview),
+                        onclick: move |_| {
+                            lock_seed_view();
+                            panel.set(WalletPanel::Overview);
+                        },
                         "Overview"
                     }
                     button {
                         class: tab_class(active_panel == WalletPanel::Receive),
                         r#type: "button",
-                        onclick: move |_| panel.set(WalletPanel::Receive),
+                        onclick: move |_| {
+                            lock_seed_view();
+                            panel.set(WalletPanel::Receive);
+                        },
                         "Receive"
                     }
                     button {
                         class: tab_class(active_panel == WalletPanel::Send),
                         r#type: "button",
-                        onclick: move |_| panel.set(WalletPanel::Send),
+                        onclick: move |_| {
+                            lock_seed_view();
+                            panel.set(WalletPanel::Send);
+                        },
                         "Send"
                     }
                     button {
                         class: tab_class(active_panel == WalletPanel::History),
                         r#type: "button",
-                        onclick: move |_| panel.set(WalletPanel::History),
+                        onclick: move |_| {
+                            lock_seed_view();
+                            panel.set(WalletPanel::History);
+                        },
                         "History"
+                    }
+                    button {
+                        class: tab_class(active_panel == WalletPanel::SeedSecurity),
+                        r#type: "button",
+                        onclick: move |_| {
+                            lock_seed_view();
+                            panel.set(WalletPanel::SeedSecurity);
+                        },
+                        "Seed & Security"
                     }
                 }
 
@@ -1087,55 +1361,28 @@ pub fn Wallet() -> Element {
                     section { class: "wallet-panel",
                         div { class: "wallet-panel__header",
                             div {
-                                h2 { "Save wallet to this browser" }
-                                p { "Encrypts the signing seed with a password and stores it only in this browser. Refreshing can then restore the wallet after you unlock it." }
+                                h2 { "Seed phrase & password protection" }
+                                p {
+                                    "Your recovery phrase is encrypted with your wallet password. Anytime you return to view your seed phrase or inspect seed details, you must verify your current password and update your password."
+                                }
                             }
+                            span { class: "pill pill--orange", "Encrypted · Locked" }
                         }
                         if let Some(message) = persist_message.read().as_ref() {
                             p { class: "wallet-field__help", "{message}" }
                         }
-                        div { class: "wallet-field",
-                            label { r#for: "wallet-persist-password", "Password" }
-                            input {
-                                id: "wallet-persist-password",
-                                class: "wallet-input",
-                                r#type: "password",
-                                value: "{persist_password.read()}",
-                                oninput: move |event| persist_password.set(event.value()),
-                                autocomplete: "new-password",
-                            }
-                            p { class: "wallet-field__help",
-                                "Use at least 8 characters. BitSabi cannot recover this password."
-                            }
-                        }
                         div { class: "wallet-flow__actions",
                             PrimaryButton {
-                                onclick: move |_| save_wallet_to_browser.call(()),
-                                if confirm_overwrite_saved() { "Confirm overwrite" } else { "Save wallet" }
+                                onclick: move |_| {
+                                    lock_seed_view();
+                                    panel.set(WalletPanel::SeedSecurity);
+                                },
+                                ShieldIcon {}
+                                "View seed phrase & update password"
                             }
-                            if confirm_overwrite_saved() {
-                                SecondaryButton {
-                                    onclick: move |_| {
-                                        confirm_overwrite_saved.set(false);
-                                        persist_message.set(None);
-                                    },
-                                    "Cancel"
-                                }
-                            }
-                            if has_saved_wallet() {
-                                SecondaryButton {
-                                    onclick: move |_| remove_saved_wallet.call(()),
-                                    if confirm_remove_saved() { "Confirm remove" } else { "Remove saved wallet" }
-                                }
-                            }
-                            if confirm_remove_saved() {
-                                SecondaryButton {
-                                    onclick: move |_| {
-                                        confirm_remove_saved.set(false);
-                                        persist_message.set(None);
-                                    },
-                                    "Cancel"
-                                }
+                            SecondaryButton {
+                                onclick: move |_| reset_wallet.call(()),
+                                "Reset wallet"
                             }
                         }
                     }
@@ -1317,6 +1564,28 @@ pub fn Wallet() -> Element {
                                 strong { "Balances scan a 20-address gap." }
                                 p {
                                     "Previously generated receiving addresses remain in this wallet and stay part of balance and history checks. Refresh after receiving funds."
+                                }
+                            }
+                        }
+
+                        // Faucet and explorer quick links for testnet testing
+                        div { class: "wallet-panel__actions",
+                            a {
+                                class: "button button--secondary",
+                                href: "{TESTNET_FAUCET_URL}",
+                                target: "_blank",
+                                rel: "noopener noreferrer",
+                                "Get testnet coins (faucet)"
+                                ExternalLinkIcon {}
+                            }
+                            if !current_receive_address.is_empty() {
+                                a {
+                                    class: "button button--secondary",
+                                    href: "https://mempool.space/testnet/address/{current_receive_address}",
+                                    target: "_blank",
+                                    rel: "noopener noreferrer",
+                                    "View address on explorer"
+                                    ExternalLinkIcon {}
                                 }
                             }
                         }
@@ -1575,21 +1844,64 @@ pub fn Wallet() -> Element {
                                 div { class: "wallet-form-grid",
                                     div { class: "wallet-field",
                                         label { r#for: "wallet-send-amount", "Amount (BTC)" }
-                                        input {
-                                            id: "wallet-send-amount",
-                                            class: "wallet-input",
-                                            r#type: "text",
-                                            inputmode: "decimal",
-                                            value: "{send_amount}",
-                                            placeholder: "0.00050000",
-                                            autocomplete: "off",
-                                            oninput: move |event| {
-                                                send_amount.set(event.value());
-                                                send_plan.set(None);
-                                                send_signed.set(None);
-                                                send_error.set(None);
-                                                broadcast_state.set(BroadcastState::Idle);
-                                            },
+                                        div { class: "payments-input-row",
+                                            input {
+                                                id: "wallet-send-amount",
+                                                class: "wallet-input",
+                                                r#type: "text",
+                                                inputmode: "decimal",
+                                                value: "{send_amount}",
+                                                placeholder: "0.00050000",
+                                                autocomplete: "off",
+                                                oninput: move |event| {
+                                                    send_amount.set(event.value());
+                                                    send_plan.set(None);
+                                                    send_signed.set(None);
+                                                    send_error.set(None);
+                                                    broadcast_state.set(BroadcastState::Idle);
+                                                },
+                                            }
+                                            // Max button: fills the full confirmed spendable balance
+                                            {
+                                                let max_sats = wallet_summary.as_ref()
+                                                    .map(|s| s.confirmed_sat.max(0) as u64)
+                                                    .unwrap_or(0);
+                                                let max_btc = if max_sats > 0 {
+                                                    let whole = max_sats / 100_000_000;
+                                                    let frac = max_sats % 100_000_000;
+                                                    format!("{whole}.{frac:08}")
+                                                } else {
+                                                    String::new()
+                                                };
+                                                rsx! {
+                                                    button {
+                                                        class: "button button--secondary button--compact",
+                                                        r#type: "button",
+                                                        disabled: max_sats == 0,
+                                                        title: "Fill the full confirmed balance",
+                                                        onclick: move |_| {
+                                                            send_amount.set(max_btc.clone());
+                                                            send_plan.set(None);
+                                                            send_signed.set(None);
+                                                            send_error.set(None);
+                                                            broadcast_state.set(BroadcastState::Idle);
+                                                        },
+                                                        "Max"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Simulated NGN equivalent hint
+                                        {
+                                            let hint = send_amount.read().trim().to_owned();
+                                            let ngn_hint = parse_send_btc_to_ngn(&hint);
+                                            rsx! {
+                                                if let Some(ngn) = ngn_hint {
+                                                    p { class: "wallet-field__help wallet-field__help--accent",
+                                                        "≈ {ngn} (simulated NGN equivalent)"
+                                                    }
+                                                }
+                                            }
                                         }
                                         p { class: "wallet-field__help",
                                             "Up to 8 decimal places. A network fee is added on top."
@@ -1767,6 +2079,226 @@ pub fn Wallet() -> Element {
                                     onclick: move |_| manual_refresh.call(()),
                                     RefreshIcon {}
                                     "Refresh"
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(summary) = wallet_summary.as_ref() {
+                        section { class: "wallet-panel",
+                            div { class: "wallet-panel__header",
+                                div {
+                                    h2 { "Spendable outputs (UTXOs)" }
+                                    p { "Confirmed unspent transaction outputs controlled by this wallet." }
+                                }
+                                span { class: "pill", "{summary.spendable_utxos().len()} confirmed" }
+                            }
+                            if summary.spendable_utxos().is_empty() {
+                                p { class: "wallet-field__help",
+                                    "No confirmed UTXOs available right now. Receive testnet coins and wait for 1 confirmation."
+                                }
+                            } else {
+                                div { class: "wallet-address-list",
+                                    for entry in summary.spendable_utxos().iter().take(10) {
+                                        div {
+                                            key: "{entry.utxo.txid}:{entry.utxo.vout}",
+                                            class: "wallet-address-row",
+                                            div {
+                                                span { class: "wallet-address-row__label",
+                                                    "{format_sats(entry.utxo.value)} ({format_satoshis(entry.utxo.value)}) · vout #{entry.utxo.vout}"
+                                                }
+                                                code { "{entry.address}" }
+                                            }
+                                            a {
+                                                class: "button button--secondary button--compact",
+                                                href: "https://mempool.space/testnet/tx/{entry.utxo.txid}",
+                                                target: "_blank",
+                                                rel: "noopener noreferrer",
+                                                "{short_txid(&entry.utxo.txid)}"
+                                                ExternalLinkIcon {}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if active_panel == WalletPanel::SeedSecurity {
+                    section { class: "wallet-panel",
+                        div { class: "wallet-panel__header",
+                            div {
+                                h2 { "Seed phrase & derivation vault" }
+                                p {
+                                    "Anytime you return here to view your recovery phrase or check seed derivation details, you must verify your current password and update your password."
+                                }
+                            }
+                            if unlocked_seed.is_some() {
+                                span { class: "pill pill--orange", "Unlocked for this view" }
+                            } else {
+                                span { class: "pill", "Locked · Password update required" }
+                            }
+                        }
+
+                        if let Some(message) = seed_auth_error.read().as_ref() {
+                            div { class: "wallet-alert wallet-alert--error", role: "alert",
+                                WarningIcon {}
+                                div {
+                                    strong { "Cannot unlock seed phrase" }
+                                    p { "{message}" }
+                                }
+                            }
+                        }
+
+                        if let Some(message) = seed_auth_success.read().as_ref() {
+                            div { class: "wallet-success", role: "status",
+                                div { class: "wallet-success__icon", CheckIcon {} }
+                                div {
+                                    strong { "Password updated & seed phrase unlocked" }
+                                    p { "{message}" }
+                                }
+                            }
+                        }
+
+                        if unlocked_seed.is_some() {
+                            div { class: "wallet-alert wallet-alert--warning",
+                                WarningIcon {}
+                                div {
+                                    strong { "Keep your recovery phrase private." }
+                                    p {
+                                        "Leaving this tab or clicking 'Lock seed phrase' will immediately hide these words again. Next time you come back, you will need to authenticate with the updated password you just set."
+                                    }
+                                }
+                            }
+
+                            section { class: "wallet-recovery", aria_label: "Unlocked recovery phrase",
+                                ol { class: "recovery-words",
+                                    for (index, word) in seed_words.iter().enumerate() {
+                                        li { key: "{index}",
+                                            span { class: "recovery-words__number", "{index + 1}" }
+                                            span { class: "recovery-words__word", "{word}" }
+                                        }
+                                    }
+                                }
+                                div { class: "wallet-flow__actions",
+                                    SecondaryButton {
+                                        onclick: move |_| copy_text_to_clipboard(
+                                            seed_phrase_to_copy.clone(),
+                                            copy_state,
+                                            copied_address,
+                                        ),
+                                        CopyIcon {}
+                                        "Copy recovery phrase"
+                                    }
+                                    PrimaryButton {
+                                        onclick: move |_| lock_seed_view(),
+                                        ShieldIcon {}
+                                        "Lock & hide seed phrase"
+                                    }
+                                }
+                            }
+
+                            div { class: "payments-quote-card",
+                                div { class: "payments-quote-card__header",
+                                    h3 { "Seed & Derivation Details" }
+                                    span { class: "pill pill--orange", "BIP39 · BIP84" }
+                                }
+                                div { class: "wallet-review__rows",
+                                    div { class: "wallet-review__row",
+                                        span { "Mnemonic standard & length" }
+                                        strong { "{seed_word_count} words · BIP39 English" }
+                                    }
+                                    div { class: "wallet-review__row",
+                                        span { "Account derivation path" }
+                                        code { "m/84'/1'/0'" }
+                                    }
+                                    div { class: "wallet-review__row",
+                                        span { "Receive branch path" }
+                                        code { "m/84'/1'/0'/0/* ({receive_addresses.len()} derived)" }
+                                    }
+                                    div { class: "wallet-review__row",
+                                        span { "Primary address (#0)" }
+                                        code { "{first_receive_address}" }
+                                    }
+                                    div { class: "wallet-review__row",
+                                        span { "Encryption cipher" }
+                                        strong { "Argon2id + AES-256-GCM (Password updated)" }
+                                    }
+                                }
+                            }
+                        } else {
+                            form {
+                                class: "wallet-form",
+                                onsubmit: move |event| {
+                                    event.prevent_default();
+                                    unlock_and_update_seed_password.call(());
+                                },
+                                div { class: "wallet-field",
+                                    label { r#for: "seed-current-password", "Current wallet password" }
+                                    input {
+                                        id: "seed-current-password",
+                                        class: "wallet-input",
+                                        r#type: "password",
+                                        placeholder: "Enter the current password protecting this wallet",
+                                        value: "{seed_current_password.read()}",
+                                        autocomplete: "current-password",
+                                        oninput: move |event| {
+                                            seed_current_password.set(event.value());
+                                            seed_auth_error.set(None);
+                                        },
+                                    }
+                                }
+                                div { class: "wallet-form-grid",
+                                    div { class: "wallet-field",
+                                        label { r#for: "seed-new-password", "Update password (min 8 characters)" }
+                                        input {
+                                            id: "seed-new-password",
+                                            class: "wallet-input",
+                                            r#type: "password",
+                                            placeholder: "Enter new updated password",
+                                            value: "{seed_new_password.read()}",
+                                            autocomplete: "new-password",
+                                            oninput: move |event| {
+                                                seed_new_password.set(event.value());
+                                                seed_auth_error.set(None);
+                                            },
+                                        }
+                                    }
+                                    div { class: "wallet-field",
+                                        label { r#for: "seed-confirm-password", "Confirm updated password" }
+                                        input {
+                                            id: "seed-confirm-password",
+                                            class: "wallet-input",
+                                            r#type: "password",
+                                            placeholder: "Re-enter updated password",
+                                            value: "{seed_confirm_password.read()}",
+                                            autocomplete: "new-password",
+                                            oninput: move |event| {
+                                                seed_confirm_password.set(event.value());
+                                                seed_auth_error.set(None);
+                                            },
+                                        }
+                                    }
+                                }
+                                p { class: "wallet-field__help",
+                                    "For security, accessing your recovery phrase requires verifying your current password and setting an updated password for future access."
+                                }
+                                div { class: "wallet-flow__actions",
+                                    SecondaryButton {
+                                        onclick: move |_| {
+                                            lock_seed_view();
+                                            panel.set(WalletPanel::Overview);
+                                        },
+                                        ArrowLeftIcon {}
+                                        "Back to overview"
+                                    }
+                                    button {
+                                        class: "button button--primary",
+                                        r#type: "submit",
+                                        ShieldIcon {}
+                                        "Update password & view seed phrase"
+                                    }
                                 }
                             }
                         }
@@ -1966,6 +2498,95 @@ fn short_txid(txid: &str) -> String {
     format!("{}…{}", &txid[..8], &txid[txid.len() - 6..])
 }
 
+/// Parse a BTC text amount from the send form and return a formatted NGN string.
+/// Returns `None` for empty or invalid input.
+fn parse_send_btc_to_ngn(input: &str) -> Option<String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    let mut parts = input.split('.');
+    let whole: u64 = parts.next()?.parse().ok()?;
+    let sats = whole.checked_mul(100_000_000)?;
+    let sats = if let Some(frac) = parts.next() {
+        if frac.is_empty() || frac.len() > 8 {
+            return None;
+        }
+        let frac_val: u64 = frac.parse().ok()?;
+        let scale = 10_u64.pow((8 - frac.len()) as u32);
+        sats.checked_add(frac_val.checked_mul(scale)?)?
+    } else {
+        sats
+    };
+    if sats == 0 {
+        return None;
+    }
+    let ngn = (sats as f64) / 100_000_000.0 * MOCK_BTC_NGN_RATE;
+    // Format with thousands separators
+    let whole_ngn = ngn as u64;
+    let digits = whole_ngn.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3 + 2);
+    grouped.push('₦');
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(character);
+    }
+    Some(grouped)
+}
+
+fn apply_simulated_txs(summary: &mut WalletSummary, primary_address: &str) {
+    let sim_txs = crate::wallet_persistence::load_simulated_txs();
+    if sim_txs.is_empty() {
+        return;
+    }
+
+    for (idx, sim_tx) in sim_txs.iter().enumerate() {
+        if summary.transactions.iter().any(|t| t.txid == sim_tx.txid) {
+            continue;
+        }
+        summary.confirmed_sat = summary.confirmed_sat.saturating_add(sim_tx.net_value_sat);
+        summary.total_sat = summary.confirmed_sat.saturating_add(summary.pending_sat);
+
+        if sim_tx.net_value_sat > 0 {
+            let addr = if sim_tx.address.is_empty() {
+                primary_address.to_owned()
+            } else {
+                sim_tx.address.clone()
+            };
+            summary.utxos.push( crate::wallet::AddressUtxo {
+                address: addr,
+                utxo: bitsabi_shared::WalletUtxo {
+                    txid: sim_tx.txid.clone(),
+                    vout: idx as u32,
+                    value: sim_tx.net_value_sat as u64,
+                    status: bitsabi_shared::TransactionStatus {
+                        confirmed: true,
+                        block_height: Some(summary.tip_height.max(85_420)),
+                        block_time: Some(sim_tx.timestamp),
+                    },
+                },
+            });
+        }
+
+        summary.transactions.insert(
+            0,
+            HistoryTransaction {
+                txid: sim_tx.txid.clone(),
+                net_value: sim_tx.net_value_sat,
+                fee: Some(sim_tx.fee_sat),
+                status: bitsabi_shared::TransactionStatus {
+                    confirmed: true,
+                    block_height: Some(summary.tip_height.max(85_420)),
+                    block_time: Some(sim_tx.timestamp),
+                },
+                confirmations: 1,
+            },
+        );
+    }
+}
+
 fn request_wallet_refresh(
     addresses: Vec<String>,
     force: bool,
@@ -1979,10 +2600,20 @@ fn request_wallet_refresh(
         return;
     }
 
+    let primary_address = addresses.first().cloned().unwrap_or_default();
     let request_id = refresh_id().wrapping_add(1);
     refresh_id.set(request_id);
     loading.set(true);
     refresh_error.set(None);
+
+    // Immediately reflect any simulated payment transactions while chain snapshot loads
+    let mut initial_summary = summary.read().clone().unwrap_or_else(|| WalletSummary {
+        tip_height: 85_420,
+        provider: "Testnet + BitSabi Simulated".to_owned(),
+        ..WalletSummary::default()
+    });
+    apply_simulated_txs(&mut initial_summary, &primary_address);
+    summary.set(Some(initial_summary));
 
     spawn(async move {
         let result = api::fetch_wallet_snapshot(addresses).await;
@@ -1992,7 +2623,8 @@ fn request_wallet_refresh(
 
         match result {
             Ok(wallet_snapshot) => {
-                let wallet_summary = WalletSummary::from_snapshot(&wallet_snapshot);
+                let mut wallet_summary = WalletSummary::from_snapshot(&wallet_snapshot);
+                apply_simulated_txs(&mut wallet_summary, &primary_address);
                 summary.set(Some(wallet_summary));
                 snapshot.set(Some(wallet_snapshot));
                 refresh_error.set(None);

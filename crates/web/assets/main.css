@@ -2846,20 +2846,108 @@ textarea {
     }
 }
 
-@media (prefers-reduced-motion: reduce) {
-    html {
-        scroll-behavior: auto;
-    }
+}
 
-    *,
-    *::before,
-    *::after {
-        transition-duration: 0.01ms !important;
-    }
+/* ─── Payments page ──────────────────────────────────────────────────── */
 
-    .button:hover,
-    .quick-card:hover,
-    .lesson-card:hover {
-        transform: none;
+.payments-quote-card {
+    background: var(--surface-2, #f8f9fa);
+    border: 1px solid var(--border, #dee2e6);
+    border-radius: var(--radius-lg, 12px);
+    padding: 1.25rem 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    margin-block-start: 1.5rem;
+}
+
+.payments-quote-card__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.payments-quote-card__header h3 {
+    margin: 0;
+    font-size: 1rem;
+}
+
+/* Row with input + unit label (or Max button) */
+.payments-input-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.payments-input-row .wallet-input {
+    flex: 1;
+    min-width: 0;
+}
+
+.payments-input-unit {
+    font-weight: 600;
+    font-size: 0.95rem;
+    white-space: nowrap;
+    color: var(--text-secondary, #6c757d);
+}
+
+/* Read-only mirror input */
+.wallet-input--readonly {
+    background: var(--surface-2, #f8f9fa);
+    color: var(--text-secondary, #6c757d);
+    cursor: default;
+}
+
+/* Compact button (Max / inline actions) */
+.button--compact {
+    padding-block: 0.35rem;
+    padding-inline: 0.75rem;
+    font-size: 0.82rem;
+    white-space: nowrap;
+}
+
+/* NGN hint below BTC amount */
+.wallet-field__help--accent {
+    color: var(--primary, #f7931a);
+    font-weight: 500;
+}
+
+/* Wallet panel actions row (faucet / explorer links) */
+.wallet-panel__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    padding-block-start: 0.75rem;
+    border-block-start: 1px solid var(--border, #dee2e6);
+    margin-block-start: 0.5rem;
+}
+
+.payments-presets {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-block-end: 1.25rem;
+}
+
+.payments-presets__label {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text-secondary, #6c757d);
+    margin-inline-end: 0.25rem;
+}
+
+@media (max-width: 600px) {
+    .payments-input-row {
+        flex-wrap: wrap;
+    }
+    .payments-quote-card {
+        padding: 1rem;
+    }
+    .wallet-panel__actions {
+        flex-direction: column;
     }
 }
+

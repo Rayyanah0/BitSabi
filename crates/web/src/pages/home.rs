@@ -115,9 +115,9 @@ pub fn Home() -> Element {
                     Link { class: "quick-card", to: Route::Wallet {},
                         div { class: "quick-card__icon", SendReceiveIcon {} }
                         div { class: "quick-card__copy",
-                            span { class: "quick-card__badge", "Coming later" }
+                            span { class: "quick-card__badge", "Testnet ready" }
                             h3 { "Send Bitcoin" }
-                            p { "Sending is not part of this testnet milestone yet. Keep your wallet ready for when it arrives." }
+                            p { "Plan fees, sign locally in your browser, and broadcast real testnet transactions." }
                         }
                         ArrowRightIcon {}
                     }
@@ -125,9 +125,9 @@ pub fn Home() -> Element {
                     Link { class: "quick-card", to: Route::Payments {},
                         div { class: "quick-card__icon", NairaIcon {} }
                         div { class: "quick-card__copy",
-                            span { class: "quick-card__badge", "Simulated" }
+                            span { class: "quick-card__badge", "Interactive demo" }
                             h3 { "NGN Payments" }
-                            p { "Preview how a bitcoin-to-naira quote and fees will be explained." }
+                            p { "Try live BTC/NGN quote calculations, fee breakdowns, and simulated testnet settlement." }
                         }
                         ArrowRightIcon {}
                     }

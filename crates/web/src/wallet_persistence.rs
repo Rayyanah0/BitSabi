@@ -228,6 +228,26 @@ pub fn envelope_from_json(value: &str) -> Result<EncryptedWallet, WalletStorageE
     Ok(envelope)
 }
 
+/// Storage key used for keeping the active wallet session open until the user clicks Reset Wallet.
+pub const ACTIVE_PHRASE_KEY: &str = "bitsabi:wallet:active_phrase:v1";
+/// Storage key used for simulated testnet transactions created from the Payments page.
+pub const SIMULATED_TXS_KEY: &str = "bitsabi:wallet:simulated_txs:v1";
+
+/// Simulated testnet transaction credited or debited from the NGN Payments simulator.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimulatedWalletTx {
+    /// Simulated transaction ID.
+    pub txid: String,
+    /// Receiving or sending wallet address.
+    pub address: String,
+    /// Net value in satoshis (positive = received into wallet, negative = sent from wallet).
+    pub net_value_sat: i64,
+    /// Network fee in satoshis.
+    pub fee_sat: u64,
+    /// Unix timestamp in seconds.
+    pub timestamp: u64,
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn save_wallet(envelope: &EncryptedWallet) -> Result<(), WalletStorageError> {
     use gloo_storage::{LocalStorage, Storage};
@@ -244,6 +264,36 @@ pub fn load_wallet() -> Option<EncryptedWallet> {
 pub fn clear_wallet() {
     use gloo_storage::{LocalStorage, Storage};
     LocalStorage::delete(STORAGE_KEY);
+    LocalStorage::delete(ACTIVE_PHRASE_KEY);
+    LocalStorage::delete(SIMULATED_TXS_KEY);
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn save_active_phrase(phrase: &str) {
+    use gloo_storage::{LocalStorage, Storage};
+    let _ = LocalStorage::set(ACTIVE_PHRASE_KEY, phrase);
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_active_phrase() -> Option<String> {
+    use gloo_storage::{LocalStorage, Storage};
+    LocalStorage::get::<String>(ACTIVE_PHRASE_KEY)
+        .ok()
+        .filter(|phrase| validate_recovery_phrase(phrase).is_ok())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_simulated_txs() -> Vec<SimulatedWalletTx> {
+    use gloo_storage::{LocalStorage, Storage};
+    LocalStorage::get::<Vec<SimulatedWalletTx>>(SIMULATED_TXS_KEY).unwrap_or_default()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn record_simulated_tx(tx: SimulatedWalletTx) {
+    use gloo_storage::{LocalStorage, Storage};
+    let mut txs = load_simulated_txs();
+    txs.insert(0, tx);
+    let _ = LocalStorage::set(SIMULATED_TXS_KEY, &txs);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -258,6 +308,32 @@ pub fn load_wallet() -> Option<EncryptedWallet> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn clear_wallet() {}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn save_active_phrase(_phrase: &str) {}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_active_phrase() -> Option<String> {
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_simulated_txs() -> Vec<SimulatedWalletTx> {
+    Vec::new()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn record_simulated_tx(_tx: SimulatedWalletTx) {}
+
+/// Returns the primary receiving address (`#0`) of the currently active wallet, if one is open.
+pub fn active_wallet_primary_address() -> Option<String> {
+    let phrase = load_active_phrase()?;
+    let session = crate::wallet::WalletSession::from_phrase(&phrase).ok()?;
+    session
+        .visible_receive_addresses()
+        .first()
+        .map(|addr| addr.address().to_owned())
+}
 
 #[cfg(test)]
 mod tests {

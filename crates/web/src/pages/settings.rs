@@ -44,8 +44,12 @@ pub fn Settings() -> Element {
                         strong { "Bitcoin testnet" }
                     }
                     div { class: "settings-card__row",
-                        span { "Wallet status" }
-                        strong { "Create and import" }
+                        span { "Wallet features" }
+                        strong { "Create, import, receive & send" }
+                    }
+                    div { class: "settings-card__row",
+                        span { "Payments mode" }
+                        strong { "Simulated NGN quotes (testnet)" }
                     }
                     Link { class: "text-link", to: Route::Wallet {}, "Open the testnet wallet" }
                 }
